@@ -1,0 +1,62 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: wireframe --default;
+}
+@plugin "daisyui/theme" {
+  name: "wireframe";
+  default: true;
+  prefersdark: false;
+  color-scheme: "light";
+  --color-base-100: oklch(100% 0 0);
+  --color-base-200: oklch(97% 0 0);
+  --color-base-300: oklch(94% 0 0);
+  --color-base-content: oklch(20% 0 0);
+  --color-primary: oklch(64% 0.222 41.116);
+  --color-primary-content: oklch(14% 0.004 49.25);
+  --color-secondary: oklch(66% 0.004 58.318);
+  --color-secondary-content: oklch(26% 0 0);
+  --color-accent: oklch(70% 0.213 47.604);
+  --color-accent-content: oklch(14% 0.004 49.25);
+  --color-neutral: oklch(87% 0 0);
+  --color-neutral-content: oklch(26% 0 0);
+  --color-info: oklch(64% 0.222 41.116);
+  --color-info-content: oklch(26% 0 0);
+  --color-success: oklch(43% 0.095 166.913);
+  --color-success-content: oklch(90% 0.093 164.15);
+  --color-warning: oklch(57% 0.245 27.325);
+  --color-warning-content: oklch(92% 0.12 95.746);
+  --color-error: oklch(44% 0.177 26.899);
+  --color-error-content: oklch(88% 0.062 18.334);
+  --radius-selector: 0.5rem;
+  --radius-field: 1rem;
+  --radius-box: 1rem;
+  --size-selector: 0.3125rem;
+  --size-field: 0.28125rem;
+  --border: 2px;
+  --depth: 1;
+  --noise: 0;
+}
+
+/* Bundled brand fonts (offline-safe) */
+@font-face {
+  font-family: 'Inter';
+  src: url('./fonts/Inter-Variable.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Instrument Serif';
+  src: url('./fonts/InstrumentSerif-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-serif: 'Instrument Serif', ui-serif, Georgia, serif;
+}
+html,
+body {
+  font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}

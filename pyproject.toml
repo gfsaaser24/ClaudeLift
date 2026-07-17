@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claudelift-engine"
+version = "0.5.0"
+description = "ClaudeLift's export engine — turns Claude Cowork (and legacy Claude Code) chats into HTML, Markdown, JSON, and CSV bundles with uploads, outputs, and the original transcript."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["claude", "cowork", "claude-code", "export", "transcript", "anthropic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/gfsaaser24/ClaudeLift"
+Repository = "https://github.com/gfsaaser24/ClaudeLift"
+Issues = "https://github.com/gfsaaser24/ClaudeLift/issues"
+
+[project.scripts]
+claudelift-export = "cowork_export:main"
+cowork-export = "cowork_export:main"
+
+[tool.setuptools]
+py-modules = ["cowork_export"]

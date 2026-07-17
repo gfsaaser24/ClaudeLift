@@ -1,0 +1,8 @@
+node_modules/
+out/
+dist/
+resources/engine/
+*.local
+
+# built MCP server bundle (npm run build:mcp)
+resources/mcp/
