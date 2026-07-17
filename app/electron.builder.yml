@@ -1,0 +1,46 @@
+appId: com.editmypodcast.claudelift
+productName: ClaudeLift
+directories:
+  output: ../dist
+  buildResources: resources
+files:
+  - out/**
+extraResources:
+  # PyInstaller onedir sidecar — EngineService resolves
+  # process.resourcesPath/engine/cowork-export/cowork-export.exe when packaged.
+  # Signed post-pack by ../scripts/sign-sidecar.cjs (afterPack below).
+  - from: resources/engine/cowork-export
+    to: engine/cowork-export
+  # Tray/app icons — tray.ts resolves process.resourcesPath/icons/tray.ico
+  # when packaged.
+  - from: resources/icons
+    to: icons
+  # Branded splash — index.ts loads process.resourcesPath/splash/splash.html
+  # while the main window boots.
+  - from: resources/splash
+    to: splash
+  # Standalone stdio MCP server (server.cjs, built by `npm run build:mcp`).
+  # Resolves the sidecar at ../engine/cowork-export/cowork-export.exe.
+  - from: resources/mcp
+    to: mcp
+win:
+  target: nsis
+  icon: resources/icons/app.ico
+  # Password comes from the CSC_KEY_PASSWORD env var — ../scripts/dist.ps1
+  # (the `npm run dist` wrapper) loads it from build/cert/dev-cert.pass
+  # (written by ../scripts/make-dev-cert.ps1) unless already set. Swap
+  # certificateFile for a real cert + set CSC_KEY_PASSWORD when one is
+  # purchased — the sidecar hook picks both up automatically.
+  signtoolOptions:
+    certificateFile: ../build/cert/dev-cert.pfx
+    signingHashAlgorithms:
+      - sha256
+    rfc3161TimeStampServer: http://timestamp.digicert.com
+nsis:
+  oneClick: true
+  perMachine: false
+  deleteAppDataOnUninstall: false
+# Signs the sidecar exe post-pack. Real implementation is ../scripts/sign-sidecar.cjs;
+# electron-builder 26 rejects hook paths outside the workspace root, so it is
+# referenced through an in-workspace shim.
+afterPack: ./hooks/sign-sidecar.cjs

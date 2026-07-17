@@ -1,0 +1,55 @@
+# Test exports
+exports/
+out/
+output/
+
+# Claude Code session storage created by working in this dir
+.claude/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+*.lnk
+ehthumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.tox/
+.coverage
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Desktop app build output
+app/resources/engine/
+
+# Code-signing certificates
+*.pfx
+*.cer
+
+# skills CLI artifacts
+.agents/
+skills-lock.json
+
+# transient render artifacts
+.playwright-mcp/
+assets/mockups/_build.css
+
+# built MCP extension staging
+mcpb/server/
+*.mcpb

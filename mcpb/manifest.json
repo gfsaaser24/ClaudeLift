@@ -1,0 +1,47 @@
+{
+  "manifest_version": "0.3",
+  "name": "claudelift",
+  "display_name": "ClaudeLift",
+  "version": "0.5.0",
+  "description": "Read and export your Claude Cowork chats from Claude Desktop or Claude Code — list tasks, get transcripts, build continuation seed prompts, list or create export bundles, and import a bundle back (dry-run by default).",
+  "author": {
+    "name": "ClaudeLift",
+    "url": "https://github.com/gfsaaser24/ClaudeLift"
+  },
+  "homepage": "https://claudelift.app",
+  "documentation": "https://github.com/gfsaaser24/ClaudeLift/blob/main/docs/MCP.md",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gfsaaser24/ClaudeLift"
+  },
+  "license": "MIT",
+  "icon": "icon.png",
+  "keywords": ["claude", "cowork", "export", "transcript", "anthropic"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/server.cjs",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/server.cjs"],
+      "env": {
+        "CLAUDELIFT_ENGINE_EXE": "${user_config.engine_path}"
+      }
+    }
+  },
+  "user_config": {
+    "engine_path": {
+      "type": "file",
+      "title": "ClaudeLift engine (cowork-export.exe)",
+      "description": "Path to the ClaudeLift export engine. Requires ClaudeLift installed. For a standard per-user install this is %LOCALAPPDATA%\\Programs\\ClaudeLift\\resources\\engine\\cowork-export\\cowork-export.exe — the default below should already be correct.",
+      "required": true,
+      "default": "${HOME}/AppData/Local/Programs/ClaudeLift/resources/engine/cowork-export/cowork-export.exe"
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": ["win32"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}
