@@ -274,6 +274,30 @@ export default function App() {
           <p className="mt-6 text-xs tracking-wide text-muted">
             v0.5.0 · MIT license · Windows 10/11
           </p>
+
+          {/* Product Hunt launch card */}
+          <div className="mx-auto mt-8 flex w-full max-w-md items-center gap-4 rounded-xl border border-border bg-surface p-4 text-left shadow-surface">
+            <img
+              src="https://ph-files.imgix.net/bd208029-e701-42a0-b4a3-b5bd3960e820.png?auto=compress,format&codec=mozjpeg&cs=strip&fit=crop&h=80&w=80"
+              alt="ClaudeLift on Product Hunt"
+              width={48}
+              height={48}
+              loading="lazy"
+              className="size-12 shrink-0 rounded-lg object-cover"
+            />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold">We're live on Product Hunt</p>
+              <p className="truncate text-sm text-muted">Time Machine for your Claude chats</p>
+            </div>
+            <a
+              href="https://www.producthunt.com/products/claudelift-git-for-claude-cowork-chats?embed=true&utm_source=embed&utm_medium=post_embed"
+              target="_blank"
+              rel="noreferrer"
+              className="shrink-0 rounded-lg bg-[#FF6154] px-3.5 py-2 text-sm font-semibold text-white transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+            >
+              Check it out →
+            </a>
+          </div>
         </section>
 
         {/* ── Demo ──────────────────────────────────────────────────────── */}
