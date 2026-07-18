@@ -298,6 +298,24 @@ export default function App() {
               Check it out →
             </a>
           </div>
+
+          {/* Uneed launch badge */}
+          <div className="mt-4 flex justify-center">
+            <a
+              href="https://www.uneed.best/tool/claudelift"
+              target="_blank"
+              rel="noreferrer"
+              aria-label="ClaudeLift on Uneed"
+              className="rounded-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+            >
+              <img
+                src="https://www.uneed.best/EMBED3.png"
+                alt="Uneed Embed Badge"
+                loading="lazy"
+                className="h-12 w-auto"
+              />
+            </a>
+          </div>
         </section>
 
         {/* ── Demo ──────────────────────────────────────────────────────── */}
