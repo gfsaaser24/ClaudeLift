@@ -24,7 +24,13 @@
 
 ## 🎬 70-second demo
 
-https://github.com/gfsaaser24/ClaudeLift/raw/main/docs/media/claudeliftlaunch.mp4
+<p align="center">
+  <a href="https://github.com/gfsaaser24/ClaudeLift/blob/main/docs/media/claudeliftlaunch.mp4">
+    <img src="docs/media/demo-preview.gif" alt="ClaudeLift demo — export a Cowork chat, then resume it in Claude Code" width="720" />
+  </a>
+</p>
+
+<p align="center"><a href="https://github.com/gfsaaser24/ClaudeLift/blob/main/docs/media/claudeliftlaunch.mp4"><b>▶&nbsp;&nbsp;Watch the full 70-second demo with sound</b></a></p>
 
 **ClaudeLift** is a Windows desktop app for taking control of your **Claude Cowork** chats. Cowork is the agent-chat feature inside Anthropic's Claude Desktop app, where each conversation ("task") runs in its own sandboxed working directory with uploads, generated outputs, an audit log, and every file the assistant wrote or edited. ClaudeLift reads all of that straight off disk and turns each chat into a self-contained, portable bundle — rendered transcripts (HTML, Markdown, JSON, CSV) alongside the chat's real files.
 
