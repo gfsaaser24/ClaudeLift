@@ -1,0 +1,16 @@
+{
+  // ClaudeLift landing page — static assets on Cloudflare Workers (free plan).
+  // Deploy: npm run deploy   (build + wrangler deploy)
+  "name": "claudelift-site",
+  "compatibility_date": "2026-07-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  },
+  // The zone already fronts these hostnames with proxied placeholder A records,
+  // so plain routes (not custom domains) are the right binding here.
+  "routes": [
+    { "pattern": "claudelift.app/*", "zone_name": "claudelift.app" },
+    { "pattern": "www.claudelift.app/*", "zone_name": "claudelift.app" }
+  ]
+}

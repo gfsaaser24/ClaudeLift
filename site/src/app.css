@@ -1,0 +1,115 @@
+@import "tailwindcss";
+@import "@heroui/styles";
+@import "@heroui-pro/react/css/components/navbar.css";
+@import "@heroui-pro/react/css/components/code-block.css";
+
+/* ── Brand fonts (bundled, offline-safe) ──────────────────────────────────── */
+@font-face {
+  font-family: 'Instrument Serif';
+  src: url('./fonts/InstrumentSerif-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Instrument Serif';
+  src: url('./fonts/InstrumentSerif-Italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('./fonts/Inter-Variable.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── "Rabbit" theme (hero3styling/global.css) ─────────────────────────────── */
+:root,
+.light,
+.default,
+[data-theme="light"],
+[data-theme="default"] {
+  /* Theme Colors */
+  --background: oklch(97.02% 0.0000 43.53);
+  --muted: oklch(55.17% 0.0000 43.53);
+  --scrollbar: oklch(87.10% 0.0000 43.53);
+  --surface-secondary: oklch(95.24% 0.0000 43.53);
+  --surface-tertiary: oklch(93.73% 0.0000 43.53);
+  --default: oklch(94.00% 0.0000 43.53);
+  --accent: oklch(68.57% 0.2010 43.53);
+  --accent-foreground: var(--eclipse);
+  --field-border: oklch(90.00% 0.0000 43.53);
+  --border: oklch(90.00% 0.0000 43.53);
+  --separator: oklch(92.00% 0.0000 43.53);
+
+  /* Border Radius */
+  --radius: 0.25rem;
+
+  /* Spacing */
+  --spacing: 0.265625rem;
+
+  /* Font */
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+
+  /* Letter Spacing */
+  --tracking-tighter: -0.07em;
+  --tracking-tight: -0.045em;
+  --tracking-normal: -0.02em;
+  --tracking-wide: 0.005em;
+  --tracking-wider: 0.03em;
+  --tracking-widest: 0.08em;
+
+}
+
+.dark,
+[data-theme="dark"] {
+  color-scheme: dark;
+  /* Theme Colors */
+  --background: oklch(12.00% 0.0000 43.53);
+  --muted: oklch(70.50% 0.0000 43.53);
+  --scrollbar: oklch(70.50% 0.0000 43.53);
+  --surface: oklch(21.03% 0.0000 43.53);
+  --surface-secondary: oklch(25.70% 0.0000 43.53);
+  --surface-secondary-foreground: oklch(25.70% 0.0000 43.53);
+  --surface-tertiary: oklch(27.21% 0.0000 43.53);
+  --surface-tertiary-foreground: oklch(27.21% 0.0000 43.53);
+  --overlay: oklch(21.03% 0.0000 43.53);
+  --default: oklch(27.40% 0.0000 43.53);
+  --accent: oklch(68.57% 0.2010 43.53);
+  --accent-foreground: var(--eclipse);
+  --field-background: oklch(21.03% 0.0000 43.53);
+  --field-placeholder: oklch(70.50% 0.0000 43.53);
+  --field-border: oklch(28.00% 0.0000 43.53);
+  --segment: oklch(39.64% 0.0000 43.53);
+  --border: oklch(28.00% 0.0000 43.53);
+  --separator: oklch(25.00% 0.0000 43.53);
+}
+
+/* ── Page-level extras ────────────────────────────────────────────────────── */
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-serif: 'Instrument Serif', ui-serif, Georgia, serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+body {
+  background: var(--background);
+  color: var(--foreground);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+::selection {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
