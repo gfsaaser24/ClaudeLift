@@ -611,3 +611,63 @@ export async function runPull(
     if (activePull?.abort === abort) activePull = null
   }
 }
+
+// ---------------------------------------------------------------------------
+// page executor for the project push (project-push.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Open https://claude.ai/ in a hidden window of the session and return an
+ * executor that runs JS in it (`executeJavaScript`, user gesture on). The
+ * caller must dispose() it. Fails when the session is not signed in.
+ */
+export async function openPushPage(): Promise<{
+  label: string
+  runInPage(js: string): Promise<unknown>
+  dispose(): void
+}> {
+  const current = await status()
+  if (!current.signedIn) throw new BridgeError('validation', current.error ?? SIGN_IN_FIRST)
+  const win = new BrowserWindow({
+    show: false,
+    width: 1200,
+    height: 900,
+    title: 'ClaudeLift project push',
+    webPreferences: { ...sessionWebPreferences(), backgroundThrottling: false }
+  })
+  track(win)
+  harden(win, false)
+  const wc = win.webContents
+  wc.setAudioMuted(true)
+  let gone: string | null = null
+  wc.on('render-process-gone', (_event, details) => {
+    gone = `The claude.ai page stopped (${details.reason}).`
+  })
+  const dispose = (): void => {
+    if (!win.isDestroyed()) win.destroy()
+  }
+  try {
+    const loadTimeout = delay(LOAD_TIMEOUT_MS).then(() => {
+      throw new BridgeError('crash', 'claude.ai did not load within 90 seconds.')
+    })
+    loadTimeout.catch(() => undefined)
+    await Promise.race([loadClaude(wc), loadTimeout])
+    await delay(SETTLE_MS)
+    const url = wc.getURL()
+    if (isLoginUrl(url)) throw new BridgeError('validation', SIGN_IN_FIRST)
+    if (!isClaudeUrl(url)) throw new BridgeError('crash', `claude.ai did not open (the page is at ${url || 'nothing'}).`)
+  } catch (err) {
+    dispose()
+    throw err
+  }
+  return {
+    label: "ClaudeLift's claude.ai sign-in",
+    async runInPage(js: string): Promise<unknown> {
+      if (gone !== null) throw new BridgeError('crash', gone)
+      if (win.isDestroyed()) throw new BridgeError('crash', 'The claude.ai page was closed.')
+      if (isLoginUrl(wc.getURL())) throw new BridgeError('validation', SIGN_IN_FIRST)
+      return wc.executeJavaScript(js, true)
+    },
+    dispose
+  }
+}

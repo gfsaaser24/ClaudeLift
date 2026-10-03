@@ -33,6 +33,7 @@ import type {
   PullChatsMode,
   WindowRect
 } from '../shared/ipc'
+import { openDesktopExecutor } from './desktop-inspector'
 
 // ---------------------------------------------------------------------------
 // constants
@@ -607,7 +608,7 @@ export async function runInConsole(js: string): Promise<{ hwnd: number; title: s
     if (win === null) {
       throw new BridgeError(
         'validation',
-        'The claude.ai DevTools window is not open. In Claude Desktop turn on Developer Mode, then press Ctrl+Shift+I on the claude.ai view.'
+        'The claude.ai DevTools window is not open (or its title is blank). In Claude Desktop turn on Developer Mode, then press Ctrl+Shift+I on the claude.ai view — or use the Main Process Debugger option below.'
       )
     }
     const saved = saveClipboard()
@@ -692,7 +693,8 @@ export async function runPull(
   req: ClaudeConsolePullRequest,
   onProgress: (event: ClaudeConsoleProgress) => void
 ): Promise<ClaudeConsolePullResult> {
-  assertWindows()
+  const viaDebugger = req.via === 'debugger'
+  if (!viaDebugger) assertWindows()
   if (activePull !== null) throw new BridgeError('validation', 'A pull is already running.')
   const abort = new AbortController()
   activePull = { runId: req.runId, abort }
@@ -733,8 +735,20 @@ export async function runPull(
       throw new BridgeError('crash', `Pull script not found: ${scriptPath}`)
     }
     emit(null)
-    const target = await runInConsole(buildPullScript(script, req))
-    hwnd = target.hwnd
+    if (viaDebugger) {
+      // No DevTools window to type into: start the script in Claude
+      // Desktop's claude.ai page through its Main Process Debugger. Its
+      // download still lands in Downloads, watched below.
+      const exec = await openDesktopExecutor(process.execPath)
+      try {
+        await exec.startInPage(buildPullScript(script, req))
+      } finally {
+        exec.dispose()
+      }
+    } else {
+      const target = await runInConsole(buildPullScript(script, req))
+      hwnd = target.hwnd
+    }
     throwIfAborted(signal)
 
     phase = 'waiting'

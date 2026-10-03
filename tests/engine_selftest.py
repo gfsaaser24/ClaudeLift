@@ -15,6 +15,7 @@ same way the Electron app will:
   5. an unexpected exception in a command exits 4 with a traceback on stderr
   6. OSError EINVAL scoping: filesystem EINVAL (filename set) is visible and
      exits 4; stream-write EINVAL (no filename) keeps the quiet exit 1
+  7. `import-space` into a temp account blanks credentials in memory notes
 
 Usage: py -3.14 tests\\engine_selftest.py
 """
@@ -245,6 +246,42 @@ def test_einval_scoping() -> None:
           "stream-write EINVAL prints no traceback")
 
 
+def test_space_memory_blanking() -> None:
+    print("[7] import-space blanks credentials in space memory notes")
+    import tempfile
+    fake = "AIza" + "Q" * 35  # built at runtime: not a real key
+    with tempfile.TemporaryDirectory(prefix="claudelift-eng-") as tmp:
+        root = Path(tmp)
+        home = root / "home"
+        home.mkdir()
+        bundle = root / "bundle"
+        (bundle / "memory").mkdir(parents=True)
+        (bundle / "space.json").write_text(json.dumps({"id": "sp-1", "name": "Keys Space"}), encoding="utf-8")
+        (bundle / "memory" / "note.md").write_text(f"gemini key: {fake}\n", encoding="utf-8")
+        (bundle / "memory" / "plain.md").write_text("nothing secret\n", encoding="utf-8")
+        ws = root / "cowork" / "acct" / "org"
+        ws.mkdir(parents=True)
+        (ws / "local_seed.json").write_text(json.dumps({
+            "sessionId": "local_seed", "processName": "seed", "cwd": "x", "createdAt": 1, "lastActivityAt": 1}),
+            encoding="utf-8")
+        env = os.environ.copy()
+        env.update({"USERPROFILE": str(home), "HOME": str(home), "PYTHONIOENCODING": "utf-8"})
+        proc = subprocess.run(
+            [sys.executable, str(ENGINE), "import-space", str(bundle), "--cowork-root", str(root / "cowork"),
+             "--docs-root", str(root / "docs"), "--allow-running", "--json"],
+            capture_output=True, env=env, cwd=str(REPO), timeout=300)
+        out = proc.stdout.decode("utf-8", "replace")
+        check(proc.returncode == 0, f"exit 0 (got {proc.returncode}; stderr: {proc.stderr[-300:]!r})")
+        check(fake not in out and fake not in proc.stderr.decode("utf-8", "replace"), "key never printed")
+        check("1 credential(s) removed" in out, "log says how many credentials were removed")
+        notes = list(ws.glob("spaces/*/memory/note.md"))
+        text = notes[0].read_text(encoding="utf-8") if notes else ""
+        check(bool(notes) and fake not in text and "[API key removed by ClaudeLift]" in text,
+              "memory note written with the key blanked")
+        plain = list(ws.glob("spaces/*/memory/plain.md"))
+        check(bool(plain) and plain[0].read_text(encoding="utf-8") == "nothing secret\n", "other notes unchanged")
+
+
 def main() -> int:
     print(f"engine: {ENGINE}")
     print(f"python: {sys.executable}")
@@ -254,6 +291,7 @@ def main() -> int:
     test_cp1252_pipe()
     test_crash_exit_code()
     test_einval_scoping()
+    test_space_memory_blanking()
     print()
     if FAILURES:
         print(f"SELFTEST FAILED — {len(FAILURES)} failure(s):")

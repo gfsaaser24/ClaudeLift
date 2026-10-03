@@ -22,6 +22,13 @@
  *      time + live screenshot).
  *    Then, shared: (3) convert-claudeai with `--pull`, (4) pick the target
  *    workspace, (5) import-all.
+ * D. Rebuild projects in the new account (new layout: projects and threads
+ *    in the cloud) — (1) engine `plan-push` over a converted account folder
+ *    (+ optional Cowork bundles), (2) check which account the claude.ai
+ *    page is signed in to (ClaudeLift's sign-in, or Claude Desktop through
+ *    its Main Process Debugger), (3) dry run, then the real push.
+ *    A/B/C targets that are new-layout folders get a warning that steers
+ *    to D (see docs/NEW-LAYOUT-SPEC.md).
  *
  * Workspaces come from migrate:listWorkspaces (email + task count per
  * workspace). The engine refuses to write while Claude Desktop is running
@@ -29,7 +36,14 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { JSX, ReactNode } from 'react'
-import { PickFolderResultSchema } from '../../shared/ipc'
+import {
+  PickFolderResultSchema,
+  PushAccountSchema,
+  PushDesktopStatusSchema,
+  PushPlanSummarySchema,
+  PushProgressSchema,
+  PushRunResultSchema
+} from '../../shared/ipc'
 import type {
   ClaudeAiPart,
   ClaudeAiPullProgress,
@@ -40,12 +54,19 @@ import type {
   ImportAllResult,
   ProgressEvent,
   PullChatsMode,
+  PushAccount,
+  PushDesktopStatus,
+  PushExecutor,
+  PushPlanSummary,
+  PushProgress,
+  PushRunResult,
   WorkspaceInfo
 } from '../../shared/ipc'
 import {
   EXPORT_BATCH_KEY,
   errorText,
   isDesktopRunningError,
+  parseIpcError,
   useAppStore,
   type EngineErrorInfo,
   type MigrateOwner
@@ -250,6 +271,14 @@ function WorkspacePicker({
                         leftover folder — not a target
                       </span>
                     )}
+                    {ws.newLayout && !ws.leftover && (
+                      <span
+                        className="badge badge-info badge-sm"
+                        title="This account keeps projects and threads in the cloud. Use card D to rebuild projects there."
+                      >
+                        new layout — use card D
+                      </span>
+                    )}
                     {sourcePath !== undefined && sourcePath === ws.path && (
                       <span className="badge badge-warning badge-sm">source</span>
                     )}
@@ -315,12 +344,15 @@ function ImportAllStep({
   owner,
   folder,
   workspace,
-  workspaceEmail
+  workspaceEmail,
+  workspaceNewLayout = false
 }: {
   owner: MigrateOwner
   folder: string
   workspace: string
   workspaceEmail: string | null
+  /** The target keeps projects in the cloud: a real import creates no projects there. */
+  workspaceNewLayout?: boolean
 }): JSX.Element {
   const migrateJob = useAppStore((s) => s.migrateJob)
   const events = useAppStore((s) => (s.importAllOwner === owner ? s.importAllProgress : null))
@@ -330,12 +362,14 @@ function ImportAllStep({
 
   const [dryRun, setDryRun] = useState(true)
   const [allowRunning, setAllowRunning] = useState(false)
+  const [importOldStyle, setImportOldStyle] = useState(false)
   const [result, setResult] = useState<ImportAllResult | null>(null)
   const [error, setError] = useState<EngineErrorInfo | null>(null)
 
   const running = migrateJob?.kind === 'importAll' && migrateJob.owner === owner
   const busy = migrateJob !== null
-  const ready = folder.trim() !== '' && workspace !== ''
+  const blockedNewLayout = workspaceNewLayout && !dryRun && !importOldStyle
+  const ready = folder.trim() !== '' && workspace !== '' && !blockedNewLayout
 
   const progress = useMemo(() => {
     let completed = 0
@@ -411,6 +445,26 @@ function ImportAllStep({
         </label>
       </div>
 
+      {workspaceNewLayout && (
+        <div role="alert" className="alert alert-info alert-vertical items-start text-left text-sm">
+          <span className="whitespace-normal">
+            This account uses the new layout: projects and threads live in the cloud. An import here
+            writes old-style Cowork files and makes no projects. Use card D, &ldquo;Rebuild projects
+            in the new account&rdquo;, instead.
+          </span>
+          <label className="label cursor-pointer gap-2">
+            <input
+              type="checkbox"
+              className="checkbox checkbox-sm"
+              checked={importOldStyle}
+              disabled={busy}
+              onChange={(e) => setImportOldStyle(e.target.checked)}
+            />
+            <span className="text-base-content">Import old-style files anyway</span>
+          </label>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
@@ -426,7 +480,7 @@ function ImportAllStep({
             Cancel
           </button>
         )}
-        {!ready && (
+        {!ready && !blockedNewLayout && (
           <span className="text-xs text-base-content/60">
             Pick a bundle folder and a target account first.
           </span>
@@ -586,6 +640,7 @@ function CoworkMoveCard({
 
   const sourceWorkspaces = workspaces.filter((ws) => ws.taskCount > 0)
   const targetEmail = workspaces.find((ws) => ws.path === target)?.email ?? null
+  const targetNewLayout = workspaces.find((ws) => ws.path === target)?.newLayout === true
   const busy = exportRunning || migrateJob !== null
 
   return (
@@ -695,7 +750,13 @@ function CoworkMoveCard({
         </Step>
 
         <Step n={3} title="Import into the target account">
-          <ImportAllStep owner="cowork" folder={folder} workspace={target} workspaceEmail={targetEmail} />
+          <ImportAllStep
+            owner="cowork"
+            folder={folder}
+            workspace={target}
+            workspaceEmail={targetEmail}
+            workspaceNewLayout={targetNewLayout}
+          />
         </Step>
       </div>
     </div>
@@ -789,6 +850,7 @@ function ClaudeAiImportCard({
   }
 
   const targetEmail = workspaces.find((ws) => ws.path === target)?.email ?? null
+  const targetNewLayout = workspaces.find((ws) => ws.path === target)?.newLayout === true
 
   return (
     <div className="card card-border bg-base-100">
@@ -939,6 +1001,7 @@ function ClaudeAiImportCard({
             folder={outputDir}
             workspace={target}
             workspaceEmail={targetEmail}
+            workspaceNewLayout={targetNewLayout}
           />
         </Step>
       </div>
@@ -1242,6 +1305,8 @@ function DevToolsPullSteps({ chats, onChatsChange, busy, exportDir, onPullStart,
   const [previewLoading, setPreviewLoading] = useState(false)
   const [pullFile, setPullFile] = useState<string | null>(null)
   const [pullError, setPullError] = useState<EngineErrorInfo | null>(null)
+  const [debuggerStatus, setDebuggerStatus] = useState<PushDesktopStatus | null>(null)
+  const [checkingDebugger, setCheckingDebugger] = useState(false)
 
   const pulling = pull?.running === true
   const found = consoleInfo?.found === true
@@ -1286,11 +1351,22 @@ function DevToolsPullSteps({ chats, onChatsChange, busy, exportDir, onPullStart,
     }
   }
 
-  const run = async (): Promise<void> => {
+  const checkDebugger = async (): Promise<void> => {
+    setCheckingDebugger(true)
+    try {
+      setDebuggerStatus(PushDesktopStatusSchema.parse(await window.api.pushDesktopStatus()))
+    } catch (err) {
+      setDebuggerStatus({ available: false, detail: errorText(err) })
+    } finally {
+      setCheckingDebugger(false)
+    }
+  }
+
+  const run = async (via: 'console' | 'debugger' = 'console'): Promise<void> => {
     setPullError(null)
     setPullFile(null)
     onPullStart()
-    const outcome = await runConsolePull(chats)
+    const outcome = await runConsolePull(chats, via)
     if (!outcome.ok) {
       if (outcome.error.kind === 'aborted') pushToast('info', 'Pull cancelled')
       else setPullError(outcome.error)
@@ -1375,6 +1451,39 @@ function DevToolsPullSteps({ chats, onChatsChange, busy, exportDir, onPullStart,
             className="max-h-64 w-full rounded-box border border-base-300 object-contain object-left-top"
           />
         )}
+        {!found && consoleInfo !== null && (
+          <div className="flex flex-col gap-2 rounded-box border border-base-300 p-2 text-sm">
+            <span className="whitespace-normal">
+              No window found, or the DevTools window has no title? Use Claude Desktop&apos;s Main
+              Process Debugger instead: Developer menu → <b>Enable Main Process Debugger</b>. Then
+              ClaudeLift runs the pull in the claude.ai page directly, with no typing.
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="btn btn-ghost btn-xs"
+                disabled={checkingDebugger || busy}
+                onClick={() => void checkDebugger()}
+              >
+                {checkingDebugger && <span className="loading loading-spinner loading-xs" aria-hidden="true" />}
+                Check debugger
+              </button>
+              {debuggerStatus !== null && (
+                <span className={debuggerStatus.available ? 'text-success' : 'text-warning'}>{debuggerStatus.detail}</span>
+              )}
+              {debuggerStatus?.available === true && (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-xs"
+                  disabled={busy || settings === null}
+                  onClick={() => void run('debugger')}
+                >
+                  Run pull through the debugger
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </Step>
 
       <Step n={2} title="Pull the account" done={pullFile !== null}>
@@ -1387,7 +1496,7 @@ function DevToolsPullSteps({ chats, onChatsChange, busy, exportDir, onPullStart,
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button type="button" className="btn btn-primary btn-sm" disabled={!canRun} onClick={() => void run()}>
+          <button type="button" className="btn btn-primary btn-sm" disabled={!canRun} onClick={() => void run('console')}>
             {pulling && <span className="loading loading-spinner loading-xs" aria-hidden="true" />}
             Run pull
           </button>
@@ -1538,6 +1647,7 @@ function ClaudeAccountPullCard({
   }, [convertEvents])
 
   const targetEmail = workspaces.find((ws) => ws.path === target)?.email ?? null
+  const targetNewLayout = workspaces.find((ws) => ws.path === target)?.newLayout === true
   const routeProps: PullRouteProps = { chats, onChatsChange: setChats, busy, exportDir, onPullStart, onPulled }
 
   return (
@@ -1640,7 +1750,629 @@ function ClaudeAccountPullCard({
             folder={convertResult?.output ?? runDir ?? ''}
             workspace={target}
             workspaceEmail={targetEmail}
+            workspaceNewLayout={targetNewLayout}
           />
+        </Step>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// card D: rebuild projects in a new-layout account (docs/NEW-LAYOUT-SPEC.md)
+// ---------------------------------------------------------------------------
+
+const PUSH_EXECUTORS: readonly { value: PushExecutor; label: string }[] = [
+  { value: 'claudeai', label: 'Sign in inside ClaudeLift (recommended)' },
+  { value: 'desktop', label: 'Claude Desktop (Main Process Debugger)' }
+]
+
+const PUSH_PHASE_LABELS: Record<PushProgress['phase'], string> = {
+  account: 'Checking the account',
+  checking: 'Checking',
+  create: 'Creating the project',
+  instructions: 'Instructions',
+  library: 'Library files',
+  memory: 'Memory notes',
+  verify: 'Reading back',
+  done: 'Done'
+}
+
+const KIND_LABELS: Record<string, string> = {
+  'claude-project': 'project',
+  'cowork-space': 'Cowork space',
+  'cowork-history': 'Cowork history',
+  'chat-history': 'chat history',
+  'account-memory': 'account memory'
+}
+
+const MAX_PUSH_LOG = 400
+
+function mb(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1)
+}
+
+function ipcErrorInfo(err: unknown): EngineErrorInfo {
+  return parseIpcError(err) ?? { kind: 'crash', message: errorText(err) }
+}
+
+function CheckField({
+  checked,
+  disabled,
+  onChange,
+  children
+}: {
+  checked: boolean
+  disabled: boolean
+  onChange: (checked: boolean) => void
+  children: ReactNode
+}): JSX.Element {
+  return (
+    <label className="label cursor-pointer justify-start gap-2">
+      <input
+        type="checkbox"
+        className="checkbox checkbox-sm"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="whitespace-normal text-base-content">{children}</span>
+    </label>
+  )
+}
+
+function RebuildProjectsCard(): JSX.Element {
+  const settings = useAppStore((s) => s.settings)
+  const session = useAppStore((s) => s.claudeAiSession)
+  const refreshSession = useAppStore((s) => s.refreshClaudeAiSession)
+  const signIn = useAppStore((s) => s.claudeAiSignIn)
+  const signOut = useAppStore((s) => s.claudeAiSignOut)
+  const pullRunning = useAppStore((s) => s.claudeAiPull?.running === true)
+
+  const [source, setSource] = useState('')
+  const [bundles, setBundles] = useState('')
+  const [includeChats, setIncludeChats] = useState(true)
+  const [includeUnfiled, setIncludeUnfiled] = useState(false)
+  const [includeAccountMemory, setIncludeAccountMemory] = useState(true)
+  const [planning, setPlanning] = useState(false)
+  const [plan, setPlan] = useState<PushPlanSummary | null>(null)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [planError, setPlanError] = useState<EngineErrorInfo | null>(null)
+
+  const [executor, setExecutor] = useState<PushExecutor>('claudeai')
+  const [desktop, setDesktop] = useState<PushDesktopStatus | null>(null)
+  const [account, setAccount] = useState<PushAccount | null>(null)
+  const [checkingAccount, setCheckingAccount] = useState(false)
+  const [accountError, setAccountError] = useState<EngineErrorInfo | null>(null)
+
+  const [dryRun, setDryRun] = useState(true)
+  const [running, setRunning] = useState(false)
+  const [progress, setProgress] = useState<PushProgress | null>(null)
+  const [log, setLog] = useState<string[]>([])
+  const [result, setResult] = useState<PushRunResult | null>(null)
+  const [runError, setRunError] = useState<EngineErrorInfo | null>(null)
+  const logRef = useRef<HTMLPreElement | null>(null)
+
+  // Default source: the converted account folder under the output folder.
+  useEffect(() => {
+    if (settings !== null && source === '') setSource(childPath(settings.outputDir, 'claude-account'))
+  }, [settings, source])
+
+  useEffect(() => {
+    void refreshSession()
+  }, [refreshSession])
+
+  useEffect(() => {
+    return window.api.onPushProgress((raw) => {
+      const parsed = PushProgressSchema.safeParse(raw)
+      if (!parsed.success) return
+      setProgress(parsed.data)
+      const line = parsed.data.line
+      if (line !== null) setLog((prev) => [...prev, line].slice(-MAX_PUSH_LOG))
+    })
+  }, [])
+
+  useEffect(() => {
+    const el = logRef.current
+    if (el !== null) el.scrollTop = el.scrollHeight
+  }, [log.length])
+
+  const checkDesktop = useCallback(async (): Promise<void> => {
+    try {
+      setDesktop(PushDesktopStatusSchema.parse(await window.api.pushDesktopStatus()))
+    } catch (err) {
+      setDesktop({ available: false, detail: errorText(err) })
+    }
+  }, [])
+
+  useEffect(() => {
+    if (executor === 'desktop') void checkDesktop()
+  }, [executor, checkDesktop])
+
+  // A different route or sign-in can mean a different account: check again.
+  useEffect(() => {
+    setAccount(null)
+    setAccountError(null)
+  }, [executor, session?.signedIn])
+
+  const makePlan = async (): Promise<void> => {
+    setPlanning(true)
+    setPlanError(null)
+    setPlan(null)
+    setResult(null)
+    try {
+      const summary = PushPlanSummarySchema.parse(
+        await window.api.pushPlan({
+          source: source.trim(),
+          ...(bundles.trim() !== '' ? { coworkBundles: bundles.trim() } : {}),
+          includeChats,
+          includeUnfiledChats: includeUnfiled,
+          includeAccountMemory,
+          orgs: []
+        })
+      )
+      setPlan(summary)
+      setSelected(new Set(summary.projects.map((p) => p.key)))
+    } catch (err) {
+      setPlanError(ipcErrorInfo(err))
+    } finally {
+      setPlanning(false)
+    }
+  }
+
+  const checkAccount = async (): Promise<void> => {
+    setCheckingAccount(true)
+    setAccountError(null)
+    setAccount(null)
+    try {
+      setAccount(PushAccountSchema.parse(await window.api.pushAccount({ executor })))
+    } catch (err) {
+      setAccountError(ipcErrorInfo(err))
+    } finally {
+      setCheckingAccount(false)
+    }
+  }
+
+  const run = async (): Promise<void> => {
+    if (plan === null) return
+    setRunning(true)
+    setRunError(null)
+    setResult(null)
+    setLog([])
+    setProgress(null)
+    try {
+      setResult(
+        PushRunResultSchema.parse(
+          await window.api.pushRun({
+            planFile: plan.planFile,
+            keys: plan.projects.filter((p) => selected.has(p.key)).map((p) => p.key),
+            executor,
+            dryRun,
+            expectEmail: account?.email ?? null
+          })
+        )
+      )
+    } catch (err) {
+      const info = ipcErrorInfo(err)
+      if (info.kind !== 'aborted') setRunError(info)
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  const toggle = (key: string): void => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const existing = useMemo(
+    () => new Set((account?.projectNames ?? []).map((n) => n.trim().toLowerCase())),
+    [account]
+  )
+  const chosen = plan?.projects.filter((p) => selected.has(p.key)) ?? []
+  const totals = chosen.reduce(
+    (acc, p) => ({
+      files: acc.files + p.counts.docs + p.counts.files + p.counts.chats + p.counts.cowork,
+      memory: acc.memory + p.counts.memory,
+      bytes: acc.bytes + p.counts.bytes
+    }),
+    { files: 0, memory: 0, bytes: 0 }
+  )
+  const signedIn = session?.signedIn === true
+  const routeReady = executor === 'claudeai' ? signedIn : desktop?.available === true
+  const canWrite = account !== null && account.email !== null
+  const busy = planning || running || checkingAccount || pullRunning
+  const hasProblems = (r: PushRunResult): boolean =>
+    r.projects.some((p) => p.error !== null || p.library.failed.length + p.memory.failed.length > 0)
+
+  return (
+    <div className="card card-border bg-base-100">
+      <div className="card-body gap-4">
+        <div>
+          <h2 className="card-title">Rebuild projects in the new account</h2>
+          <p className="text-sm text-base-content/70">
+            For accounts with the new layout (projects hold threads, and everything lives in the
+            cloud). ClaudeLift makes each project with its instructions, files, old chats and memory.
+            It never deletes or replaces anything, and it skips projects whose name is already there.
+          </p>
+        </div>
+
+        <Step n={1} title="Make the plan" done={plan !== null}>
+          <FolderField
+            label="Saved account folder (from card C: has projects, account and conversations folders)"
+            value={source}
+            purpose="Choose the converted claude.ai account folder"
+            disabled={busy}
+            onChange={setSource}
+          />
+          <FolderField
+            label="Cowork task bundles (optional: the folder card A exported to)"
+            value={bundles}
+            purpose="Choose the folder with exported Cowork task bundles"
+            disabled={busy}
+            onChange={setBundles}
+          />
+          <div className="flex flex-col gap-1">
+            <CheckField checked={includeChats} disabled={busy} onChange={setIncludeChats}>
+              Old chats of each project (into its Library, chats folder)
+            </CheckField>
+            <CheckField checked={includeUnfiled} disabled={busy} onChange={setIncludeUnfiled}>
+              Chats in no project (a &ldquo;Chat history (imported)&rdquo; project)
+            </CheckField>
+            <CheckField checked={includeAccountMemory} disabled={busy} onChange={setIncludeAccountMemory}>
+              Account memory (an &ldquo;Account memory (imported)&rdquo; project)
+            </CheckField>
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm self-start"
+            disabled={busy || source.trim() === ''}
+            onClick={() => void makePlan()}
+          >
+            {planning && <span className="loading loading-spinner loading-xs" aria-hidden="true" />}
+            Make plan
+          </button>
+          {planError !== null && <ErrorAlert error={planError} />}
+          {plan !== null && (
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span>
+                  {chosen.length} of {plan.projects.length} projects chosen · {totals.files} Library files ·{' '}
+                  {totals.memory} memory notes · {mb(totals.bytes)} MB
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-xs"
+                  disabled={busy}
+                  onClick={() => setSelected(new Set(plan.projects.map((p) => p.key)))}
+                >
+                  All
+                </button>
+                <button type="button" className="btn btn-ghost btn-xs" disabled={busy} onClick={() => setSelected(new Set())}>
+                  None
+                </button>
+              </div>
+              <div className="max-h-80 overflow-auto rounded-box border border-base-300">
+                <table className="table table-xs table-pin-rows">
+                  <thead>
+                    <tr>
+                      <th>
+                        <span className="sr-only">Chosen</span>
+                      </th>
+                      <th>Project</th>
+                      <th className="text-right">Docs</th>
+                      <th className="text-right">Files</th>
+                      <th className="text-right">Chats</th>
+                      <th className="text-right">Cowork</th>
+                      <th className="text-right">Memory</th>
+                      <th className="text-right">MB</th>
+                      <th>Notes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {plan.projects.map((p) => (
+                      <tr key={p.key}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            className="checkbox checkbox-xs"
+                            aria-label={`Rebuild ${p.name}`}
+                            checked={selected.has(p.key)}
+                            disabled={busy}
+                            onChange={() => toggle(p.key)}
+                          />
+                        </td>
+                        <td className="max-w-56">
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span className="truncate font-medium" title={p.name}>
+                              {p.name}
+                            </span>
+                            <span className="badge badge-ghost badge-xs">{KIND_LABELS[p.kind] ?? p.kind}</span>
+                            {existing.has(p.name.trim().toLowerCase()) && (
+                              <span
+                                className="badge badge-warning badge-xs"
+                                title="A project with this name is in the account. It will be skipped."
+                              >
+                                exists
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="text-right tabular-nums">{p.counts.docs}</td>
+                        <td className="text-right tabular-nums">{p.counts.files}</td>
+                        <td className="text-right tabular-nums">{p.counts.chats}</td>
+                        <td className="text-right tabular-nums">{p.counts.cowork}</td>
+                        <td className="text-right tabular-nums">{p.counts.memory}</td>
+                        <td className="text-right tabular-nums">{mb(p.counts.bytes)}</td>
+                        <td>
+                          {p.warnings.length > 0 && (
+                            <span className="badge badge-info badge-xs" title={p.warnings.join('\n')}>
+                              {p.warnings.length} {p.warnings.length === 1 ? 'note' : 'notes'}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {plan.skipped.length > 0 && (
+                <p className="text-xs text-base-content/60">Left out (empty): {plan.skipped.join(', ')}</p>
+              )}
+              <p className="text-xs text-base-content/60">
+                API keys and tokens are removed from memory notes and text files before upload.
+              </p>
+            </div>
+          )}
+        </Step>
+
+        <Step n={2} title="Check the new account" done={account !== null}>
+          <div role="tablist" aria-label="Where to run" className="tabs tabs-box tabs-sm self-start">
+            {PUSH_EXECUTORS.map((r) => (
+              <button
+                key={r.value}
+                type="button"
+                role="tab"
+                aria-selected={executor === r.value}
+                className={`tab ${executor === r.value ? 'tab-active' : ''}`}
+                disabled={busy}
+                onClick={() => setExecutor(r.value)}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+          {executor === 'claudeai' ? (
+            <div className="flex flex-col gap-2 text-sm">
+              <span className={signedIn ? 'text-success' : 'text-warning'}>
+                {signedIn
+                  ? `ClaudeLift is signed in to claude.ai${session.orgNames.length > 0 ? `: ${session.orgNames.join(', ')}` : ''}.`
+                  : 'ClaudeLift is not signed in to claude.ai.'}
+              </span>
+              <p className="text-xs text-base-content/60">
+                Sign in as the NEW account. If you pulled the old account here (card C), sign out
+                first, then sign in again.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" className="btn btn-sm" disabled={busy} onClick={() => void signIn()}>
+                  {signedIn ? 'Sign in again' : 'Sign in'}
+                </button>
+                {signedIn && (
+                  <button type="button" className="btn btn-sm" disabled={busy} onClick={() => void signOut()}>
+                    Sign out
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2 text-sm">
+              <span className={desktop?.available === true ? 'text-success' : 'text-warning'}>
+                {desktop === null ? 'Checking…' : desktop.detail}
+              </span>
+              <p className="text-xs text-base-content/60">
+                Claude Desktop must be signed in to the new account. Turn the debugger off again when
+                you are done (or restart Claude Desktop).
+              </p>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm self-start"
+                disabled={busy}
+                onClick={() => void checkDesktop()}
+              >
+                Check again
+              </button>
+            </div>
+          )}
+          <button
+            type="button"
+            className="btn btn-sm self-start"
+            disabled={busy || !routeReady}
+            onClick={() => void checkAccount()}
+          >
+            {checkingAccount && <span className="loading loading-spinner loading-xs" aria-hidden="true" />}
+            Check account
+          </button>
+          {accountError !== null && <ErrorAlert error={accountError} />}
+          {account !== null && (
+            <div role="status" className="alert alert-vertical items-start text-left text-sm">
+              <span>
+                Account: <span className="font-semibold">{account.email ?? 'unknown email'}</span>
+                {account.orgName !== null ? ` · ${account.orgName}` : ''}
+              </span>
+              <span className="whitespace-normal">
+                {account.projectNames.length} {account.projectNames.length === 1 ? 'project' : 'projects'} there now
+                {account.projectNames.length > 0
+                  ? `: ${account.projectNames.slice(0, 8).join(', ')}${account.projectNames.length > 8 ? '…' : ''}`
+                  : ''}
+              </span>
+              {account.email === null && (
+                <span className="text-warning">ClaudeLift could not read the email, so it can only do a dry run.</span>
+              )}
+            </div>
+          )}
+        </Step>
+
+        <Step n={3} title="Rebuild" done={result !== null && !result.dryRun && !hasProblems(result)}>
+          <label className="label cursor-pointer justify-start gap-2">
+            <input
+              type="checkbox"
+              className="toggle toggle-sm"
+              checked={dryRun}
+              disabled={busy}
+              onChange={(e) => setDryRun(e.target.checked)}
+            />
+            <span className="text-base-content">Dry run (only check, write nothing)</span>
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className={`btn btn-sm ${dryRun ? 'btn-primary' : 'btn-warning'}`}
+              disabled={busy || plan === null || chosen.length === 0 || !routeReady || (!dryRun && !canWrite)}
+              onClick={() => void run()}
+            >
+              {running && <span className="loading loading-spinner loading-xs" aria-hidden="true" />}
+              {dryRun
+                ? `Dry run (${chosen.length} projects)`
+                : `Write ${chosen.length} projects to ${account?.email ?? '…'}`}
+            </button>
+            {running && (
+              <button type="button" className="btn btn-error btn-sm" onClick={() => void window.api.pushCancel()}>
+                Cancel
+              </button>
+            )}
+            {!dryRun && !canWrite && (
+              <span className="text-xs text-base-content/60">Check the account first (step 2).</span>
+            )}
+          </div>
+
+          {running && progress !== null && (
+            <div className="flex flex-col gap-1">
+              <div className="flex flex-wrap items-center gap-3 text-sm">
+                {progress.total > 0 && progress.index > 0 && (
+                  <span className="tabular-nums">
+                    {progress.index}/{progress.total}
+                  </span>
+                )}
+                <span className="truncate font-medium">{progress.name ?? ''}</span>
+                <span className="text-base-content/70">{PUSH_PHASE_LABELS[progress.phase]}</span>
+                {progress.of > 0 && (
+                  <span className="tabular-nums text-base-content/70">
+                    {progress.done}/{progress.of}
+                  </span>
+                )}
+              </div>
+              {progress.of > 0 ? (
+                <progress className="progress" value={progress.done} max={progress.of} />
+              ) : (
+                <progress className="progress" />
+              )}
+            </div>
+          )}
+          {log.length > 0 && (
+            <pre
+              ref={logRef}
+              aria-label="Push log"
+              className="max-h-48 overflow-auto whitespace-pre-wrap rounded-box border border-base-300 bg-base-200 p-2 font-mono text-xs"
+            >
+              {log.join('\n')}
+            </pre>
+          )}
+          {runError !== null && <ErrorAlert error={runError} />}
+
+          {result !== null && (
+            <div className="flex flex-col gap-2">
+              <div
+                role="alert"
+                className={`alert alert-vertical items-start text-left text-sm ${
+                  hasProblems(result) ? 'alert-warning' : 'alert-success'
+                }`}
+              >
+                <span className="font-semibold">
+                  {result.dryRun ? 'Dry run — nothing written. ' : ''}
+                  {result.cancelled ? 'Cancelled. ' : ''}
+                  {result.projects.filter((p) => p.action === 'create').length} to create ·{' '}
+                  {result.projects.filter((p) => p.action === 'resume').length} to finish ·{' '}
+                  {result.projects.filter((p) => p.action === 'skip').length} skipped (
+                  {result.account.email ?? 'unknown account'})
+                </span>
+                <span className="max-w-full truncate font-mono text-xs" title={result.receiptFile}>
+                  Receipt: {result.receiptFile}
+                </span>
+              </div>
+              <div className="max-h-80 overflow-auto rounded-box border border-base-300">
+                <table className="table table-xs table-pin-rows">
+                  <thead>
+                    <tr>
+                      <th>Project</th>
+                      <th>Action</th>
+                      <th className="text-right">Files</th>
+                      <th className="text-right">Memory</th>
+                      <th>Problems</th>
+                      <th>
+                        <span className="sr-only">Link</span>
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.projects.map((p) => {
+                      const failed = [...p.library.failed, ...p.memory.failed]
+                      return (
+                        <tr key={p.key}>
+                          <td className="max-w-56 truncate" title={p.name}>
+                            {p.name}
+                          </td>
+                          <td>
+                            <span
+                              className={`badge badge-xs ${p.action === 'skip' ? 'badge-ghost' : 'badge-primary'}`}
+                              title={p.reason ?? ''}
+                            >
+                              {p.action}
+                            </span>
+                          </td>
+                          <td className="text-right tabular-nums">
+                            {result.dryRun
+                              ? p.library.planned
+                              : `${p.library.written + p.library.existing}/${p.library.planned}`}
+                          </td>
+                          <td className="text-right tabular-nums">
+                            {result.dryRun ? p.memory.planned : `${p.memory.written + p.memory.existing}/${p.memory.planned}`}
+                          </td>
+                          <td className="max-w-64">
+                            {p.error !== null && <span className="text-error">{p.error}</span>}
+                            {failed.length > 0 && (
+                              <span
+                                className="badge badge-warning badge-xs"
+                                title={failed.map((f) => `${f.path}: ${f.error ?? f.status ?? f.step}`).join('\n')}
+                              >
+                                {failed.length} failed
+                              </span>
+                            )}
+                          </td>
+                          <td>
+                            {p.url !== null && (
+                              <a className="link text-xs" href={p.url} target="_blank" rel="noreferrer">
+                                Open
+                              </a>
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {result.dryRun && (
+                <p className="text-xs text-base-content/60">
+                  Turn off Dry run and press Write to make the projects. You can run it again at any
+                  time: done projects are skipped and unfinished ones are completed.
+                </p>
+              )}
+            </div>
+          )}
         </Step>
       </div>
     </div>
@@ -1704,6 +2436,7 @@ export default function MigrateView(): JSX.Element {
         onRefreshWorkspaces={() => void refresh()}
         exportDir={claudeAiExportDir}
       />
+      <RebuildProjectsCard />
     </div>
   )
 }

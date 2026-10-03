@@ -88,7 +88,8 @@ No Python, no command line, nothing to install first. ClaudeLift ships a bundled
 - **Move Cowork to another account.** Export every chat, then import it into the other account's Cowork folder. Each chat keeps its space: the space is recreated on the target account (matched by name) with its instructions and memory notes, and Claude Desktop links it to a claude.ai project for that account on the next start.
 - **Import a claude.ai data export.** Point ClaudeLift at the folder from claude.ai → Settings → Privacy → Export data (the `conversations-*.zip`, `projects-*.zip`, `memories-*.zip` files). Each chat becomes a resumable Cowork task, each project becomes a space (instructions, knowledge docs in `~/Claude/Projects/<name>`, project memory), and account memory goes into an "Account memory (imported)" space.
 - **Pull your whole claude.ai account.** The data export leaves out uploaded project files, your personal preferences, skills, which project each chat belongs to, and other organizations. ClaudeLift gets all of it by running `scripts/pull-claude-projects.js` in a claude.ai page: either its own sign-in window (recommended), or Claude Desktop's DevTools (Developer Mode on, then **Developer → Show All Dev Tools**, and use the window titled `Developer Tools - https://claude.ai/…`). See **[docs/CLAUDEAI.md](docs/CLAUDEAI.md)**.
-- Pick the target account from a list (email + task count). Sign in to it in Claude Desktop once first, and **quit Claude Desktop before importing** — it keeps spaces in memory and would overwrite the import. `spaces.json` is backed up before the first change.
+- **Rebuild projects in the new account.** Newer Claude accounts keep projects and threads in the cloud (no Cowork spaces on the PC). For those, ClaudeLift makes each project through claude.ai itself: instructions, knowledge docs and uploaded files in the project Library, old chats and Cowork tasks as readable transcripts, memory notes (credentials removed). Dry run first, skips names that exist, never deletes, and writes a receipt so a run can be finished later. It runs in ClaudeLift's own claude.ai sign-in, or in Claude Desktop through **Developer → Enable Main Process Debugger**. See **[docs/CLAUDEAI.md](docs/CLAUDEAI.md#rebuilding-projects-in-a-new-layout-account)**.
+- Pick the target account from a list (email + task count). New-layout accounts are marked, and the old-style import steers you to the rebuild instead. Sign in to it in Claude Desktop once first, and **quit Claude Desktop before importing** — it keeps spaces in memory and would overwrite the import. `spaces.json` is backed up before the first change.
 - Dry run by default; nothing is deleted.
 
 The same steps from the command line:
@@ -98,6 +99,7 @@ python cowork_export.py export all -o .\account-move                     # every
 python cowork_export.py convert-claudeai "$HOME\Downloads\Claude Download" -o .\claudeai
 python cowork_export.py import-all .\account-move --workspace <...\local-agent-mode-sessions\<acct>\<org>> --dry-run
 python cowork_export.py import-all .\claudeai     --workspace <...> --dry-run
+python cowork_export.py plan-push --source .\claude-account --cowork-bundles .\account-move --out .\push-plans\plan.json   # new-layout plan
 ```
 
 ### 🔗 Notion export

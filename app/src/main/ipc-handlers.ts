@@ -7,7 +7,8 @@
  * registerNotionHandlers (Task 13), the migrate:* channels to
  * registerMigrateHandlers, the claudeConsole:* channels to
  * registerClaudeConsoleHandlers, the claudeAi:* channels to
- * registerClaudeAiSessionHandlers, and registers the rest here:
+ * registerClaudeAiSessionHandlers, the push:* channels to registerPushHandlers,
+ * and registers the rest here:
  * settings, folder picker, diagnostics.
  *
  * ERROR CONVENTION — identical to register-tasks.ts (its `toIpcError` is
@@ -33,6 +34,7 @@ import { registerClaudeAiSessionHandlers } from './register-claudeai-session'
 import { registerMcpHandlers } from './register-mcp'
 import { registerMigrateHandlers } from './register-migrate'
 import { registerNotionHandlers } from './register-notion'
+import { registerPushHandlers } from './register-push'
 import { registerTaskHandlers, type SendToRenderer } from './register-tasks'
 import type { StateStore } from './state'
 import { discoverRoots, type WatcherService } from './watcher'
@@ -183,4 +185,8 @@ export function registerAllHandlers(options: RegisterAllOptions): void {
   // -- claude.ai session (ClaudeLift's own claude.ai window) ---------------------
 
   registerClaudeAiSessionHandlers({ ipcMain, state, sendToRenderer })
+
+  // -- push (rebuild projects in a new-layout account) ---------------------------
+
+  registerPushHandlers({ ipcMain, engine, state, sendToRenderer })
 }

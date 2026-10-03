@@ -870,9 +870,12 @@ def _plugin_has_literal_secret(plugin_dir: Path) -> bool:
     """True when the plugin's .mcp.json carries a literal env / header value
     (an API key typed into the config instead of a ${VAR} placeholder)."""
     try:
-        data = json.loads((plugin_dir / ".mcp.json").read_text(encoding="utf-8"))
+        raw = (plugin_dir / ".mcp.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return False
+    if _engine().SECRET_RE.search(raw):
+        return True
     servers = data.get("mcpServers", data) if isinstance(data, dict) else {}
     for s in servers.values() if isinstance(servers, dict) else []:
         if not isinstance(s, dict):
@@ -1193,3 +1196,428 @@ def convert(
         "projects": [{"uuid": p["uuid"], "name": p.get("name")} for p in ex.projects],
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Push plan: what to create in a new-layout account (docs/NEW-LAYOUT-SPEC.md).
+# The plan names files on disk; the app uploads them one by one.
+# ---------------------------------------------------------------------------
+
+PLAN_VERSION = 1
+INSTRUCTIONS_MAX = 16_000
+INSTRUCTIONS_FULL_NAME = "INSTRUCTIONS (full).md"
+COWORK_HISTORY = "Cowork history (imported)"
+CHAT_HISTORY = "Chat history (imported)"
+ACCOUNT_MEMORY = "Account memory (imported)"
+PLAN_MEMORY_SKIP = {"cloud-memory.json"}  # duplicate of cloud-memory.md
+PLAN_MEMORY_RENAME = {"cloud-memory.md": "project-memory.md"}
+PLAN_MEMORY_WARN_BYTES = 48_896
+_ORG_DIR = re.compile(r"^(.*?)\s*\([0-9a-f]{8}\)$")
+_SYNTHETIC_KINDS = ("cowork-history", "chat-history", "account-memory")
+
+
+def _find_key(obj: Any, key: str) -> Any:
+    """First value stored under ``key`` anywhere in nested dicts / lists."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            v = cur.get(key)
+            if v:
+                return v
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+def _plan_mime(p: Path) -> str:
+    import mimetypes
+    if p.suffix.lower() in (".md", ".markdown"):
+        return "text/markdown"
+    return mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+
+
+def _org_of_dir(d: Path) -> str:
+    m = _ORG_DIR.match(d.name)
+    return (m.group(1) if m else d.name).strip()
+
+
+def _ms_date(v: Any) -> str:
+    try:
+        return datetime.fromtimestamp(int(v) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+def _dated_name(date: str, title: str) -> str:
+    return f"{(date + ' ' if date else '')}{title}"[:120].rstrip(". ") + ".md"
+
+
+class _PlanProject:
+    """One project of a push plan while it is being built. Blanked copies go
+    to ``<staging>/<n><suffix>`` (short names: Windows path limits); the
+    Library path is kept in the plan entry."""
+
+    def __init__(self, key: str, name: str, source_name: str, org: str | None, kind: str,
+                 staging: Path, created_at: str = "") -> None:
+        self.key, self.name, self.source_name, self.org, self.kind = key, name, source_name, org, kind
+        self.staging = staging
+        self.created_at = created_at
+        self.instructions = ""
+        self.library: list[dict[str, Any]] = []
+        self.memory: list[dict[str, Any]] = []
+        self.counts = {"docs": 0, "files": 0, "chats": 0, "cowork": 0, "memory": 0, "bytes": 0, "keys_removed": 0}
+        self.warnings: list[str] = []
+        self._paths: set[str] = set()
+        self._staged = 0
+
+    def _unique(self, rel: str) -> str:
+        if rel.lower() not in self._paths:
+            return rel
+        head, _, last = rel.rpartition("/")
+        stem, dot, suffix = last.rpartition(".")
+        if not dot or not stem:
+            stem, suffix = last, ""
+        for i in range(2, 10_000):
+            cand = f"{head + '/' if head else ''}{stem} ({i}){'.' + suffix if suffix else ''}"
+            if cand.lower() not in self._paths:
+                return cand
+        raise ValueError(f"too many files named {rel}")
+
+    def _stage(self, rel: str, text: str, encoding: str = "utf-8", errors: str = "strict") -> Path:
+        self._staged += 1
+        suffix = Path(rel.rsplit("/", 1)[-1]).suffix[:12]
+        dest = self.staging / f"{self._staged}{suffix}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _engine().write_sniffed(dest, text, encoding, errors)
+        return dest
+
+    def add_file(self, rel: str, file: Path, category: str) -> None:
+        ce = _engine()
+        rel = self._unique(rel)
+        try:
+            sniffed = ce.sniff_text(file)
+            n = 0
+            if sniffed is not None:
+                new, n = ce.blank_secrets(sniffed[0])
+                if n:
+                    file = self._stage(rel, new, sniffed[1], sniffed[2])
+            size = file.stat().st_size
+        except UnicodeDecodeError:
+            self.warnings.append(f"{rel} left out: its text cannot be read to check for credentials")
+            return
+        except OSError as e:
+            self.warnings.append(f"{rel} left out: {e.__class__.__name__} while reading it")
+            return
+        if n:
+            self.counts["keys_removed"] += n
+            self.warnings.append(f"{n} credential(s) removed from {rel}")
+        self._paths.add(rel.lower())
+        self.library.append({"path": rel, "file": str(file.resolve()), "size": size, "mime": _plan_mime(file)})
+        self.counts[category] += 1
+        self.counts["bytes"] += size
+
+    def set_instructions(self, text: str) -> None:
+        new, n = _engine().blank_secrets(text or "")
+        if n:
+            self.counts["keys_removed"] += n
+            self.warnings.append(f"{n} credential(s) removed from the instructions")
+        if len(new) > INSTRUCTIONS_MAX:
+            try:
+                self.add_file(INSTRUCTIONS_FULL_NAME, self._stage(INSTRUCTIONS_FULL_NAME, new), "docs")
+                self.warnings.append(f"instructions truncated ({len(new):,} chars); full text in {INSTRUCTIONS_FULL_NAME}")
+            except OSError as e:
+                self.warnings.append(f"instructions truncated ({len(new):,} chars); the full text could not be "
+                                     f"staged ({e.__class__.__name__})")
+            new = new[: INSTRUCTIONS_MAX - 80] + f"\n\n[Continued in the Library: {INSTRUCTIONS_FULL_NAME}]"
+        self.instructions = new
+
+    def add_memory(self, path: str, file: Path) -> None:
+        try:
+            sniffed = _engine().sniff_text(file)
+        except (OSError, UnicodeDecodeError) as e:
+            self.warnings.append(f"memory note {path} left out: it cannot be read ({e.__class__.__name__})")
+            return
+        if sniffed is None:
+            self.warnings.append(f"memory note {path} left out: it is not text")
+            return
+        text = sniffed[0]
+        if sniffed[2] == "surrogateescape":
+            # A memory note is sent as JSON text: keep what decodes.
+            text = text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+        new, n = _engine().blank_secrets(text)
+        if n:
+            self.counts["keys_removed"] += n
+            self.warnings.append(f"{n} credential(s) removed from memory note {path}")
+        size = len(new.encode("utf-8"))
+        if size > PLAN_MEMORY_WARN_BYTES:
+            self.warnings.append(f"memory note {path} is large ({size:,} bytes); it may be rejected")
+        self.memory.append({"path": path, "content": new, "redacted": n})
+        self.counts["memory"] += 1
+
+    def add_memory_dir(self, mem: Path) -> None:
+        for p in sorted(mem.rglob("*")) if mem.is_dir() else []:
+            try:
+                if not p.is_file() or p.name.startswith(".") or p.name in PLAN_MEMORY_SKIP or not p.stat().st_size:
+                    continue
+            except OSError:
+                continue
+            rel = p.relative_to(mem).as_posix()
+            if "/" not in rel:
+                rel = PLAN_MEMORY_RENAME.get(rel, rel)
+            self.add_memory("/" + rel, p)
+
+    @property
+    def empty(self) -> bool:
+        return not (self.instructions.strip() or self.library or self.memory)
+
+    def to_json(self) -> dict[str, Any]:
+        return {"key": self.key, "name": self.name, "source_name": self.source_name, "org": self.org,
+                "kind": self.kind, "instructions": self.instructions, "library": self.library,
+                "memory": self.memory, "counts": self.counts, "warnings": self.warnings, "empty": self.empty}
+
+
+def _read_chat_index(source: Path) -> list[dict[str, Any]]:
+    """Every chat in account/<org>/chats-index.json, tagged with its org name."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    acct = source / "account"
+    for idx in sorted(acct.glob("*/chats-index.json")) if acct.is_dir() else []:
+        try:
+            rows = json.loads(idx.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for c in rows if isinstance(rows, list) else []:
+            if isinstance(c, dict) and c.get("uuid") and c["uuid"] not in seen:
+                seen.add(c["uuid"])
+                out.append({**c, "_org": _org_of_dir(idx.parent)})
+    return out
+
+
+def _chat_rel(c: dict[str, Any]) -> str:
+    date = str(c.get("updated_at") or c.get("created_at") or "")[:10]
+    return _dated_name(date, _safe_filename(c.get("name") or "", "Untitled chat"))
+
+
+def build_push_plan(
+    source: Path,
+    out: Path,
+    *,
+    cowork_bundles: Path | None = None,
+    include_chats: bool = True,
+    include_unfiled_chats: bool = False,
+    include_account_memory: bool = True,
+    orgs: list[str] | None = None,
+    projects: list[str] | None = None,
+    include_empty: bool = False,
+) -> dict[str, Any]:
+    """Read a converted folder (``convert-claudeai`` output) and write a push
+    plan: one entry per project to create in a new-layout account, with its
+    instructions, Library files (paths on disk, not bytes) and memory notes
+    (credentials blanked). Text files that hold credentials are copied,
+    blanked, to ``<plan stem>.staging/`` next to the plan (its own folder, so
+    plans in one directory never share copies). Nothing is uploaded here."""
+    source = source.resolve()
+    out = out.resolve()
+    staging = out.with_name(out.stem + ".staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+    want_orgs = {o.strip().lower() for o in orgs or [] if o.strip()}
+
+    def org_ok(org: str | None) -> bool:
+        return not want_orgs or (org or "").strip().lower() in want_orgs
+
+    skipped: list[dict[str, Any]] = []
+    plan_projects: list[_PlanProject] = []
+    made = [0]
+
+    def new_project(key: str, name: str, source_name: str, org: str | None, kind: str, created_at: str = "") -> _PlanProject:
+        made[0] += 1
+        return _PlanProject(key, name, source_name, org, kind, staging / str(made[0]), created_at)
+
+    by_uuid: dict[str, _PlanProject] = {}
+    by_space: dict[str, _PlanProject] = {}
+    # Projects left out here, so their chats and Cowork tasks are reported
+    # instead of landing in another project: uuid / space id -> name.
+    gone_uuid: dict[str, str] = {}
+    gone_space: dict[str, str] = {}
+    gone_names: set[str] = set()
+    pdirs = source / "projects"
+    for pj in sorted(pdirs.glob("*/project.json")) if pdirs.is_dir() else []:
+        pdir = pj.parent
+        try:
+            meta = json.loads(pj.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            skipped.append({"name": pdir.name, "reason": f"unreadable project.json ({e.__class__.__name__})"})
+            continue
+        puuid = str(meta.get("uuid") or pdir.name)
+        org = meta.get("org") if isinstance(meta.get("org"), str) else None
+        src_name = (meta.get("name") or "").strip()
+        space_id = _find_key(meta.get("_pull"), "local_space_id")
+        reason = "starter project" if meta.get("is_starter_project") else \
+            "" if org_ok(org) else f"organization {org or 'unknown'} not chosen"
+        if reason:
+            label = src_name or pdir.name
+            skipped.append({"name": label, "reason": reason})
+            gone_uuid[puuid] = label
+            if space_id:
+                gone_space[str(space_id)] = label
+            if src_name:
+                gone_names.add(src_name.lower())
+            continue
+        p = new_project(puuid, src_name or f"Untitled ({puuid[:8]})", src_name, org,
+                        "cowork-space" if space_id else "claude-project", str(meta.get("created_at") or ""))
+        instructions = meta.get("prompt_template") or ""
+        if not instructions and (pdir / "space.json").is_file():
+            try:
+                instructions = json.loads((pdir / "space.json").read_text(encoding="utf-8")).get("instructions") or ""
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+        p.set_instructions(instructions)
+        for sub, prefix, cat in (("docs", "", "docs"), ("files", "files/", "files")):
+            d = pdir / sub
+            for f in sorted(d.rglob("*")) if d.is_dir() else []:
+                if f.is_file():
+                    p.add_file(prefix + f.relative_to(d).as_posix(), f, cat)
+        p.add_memory_dir(pdir / "memory")
+        plan_projects.append(p)
+        by_uuid[puuid] = p
+        if space_id:
+            by_space[str(space_id)] = p
+
+    dropped: dict[tuple[str, str], int] = {}  # (what, project) -> count
+
+    if include_chats:
+        for c in _read_chat_index(source):
+            puuid = c.get("project_uuid") or ""
+            md = source / "conversations" / str(c["uuid"]) / "session.md"
+            if puuid in gone_uuid:
+                dropped[("chat", gone_uuid[puuid])] = dropped.get(("chat", gone_uuid[puuid]), 0) + 1
+            elif puuid in by_uuid and md.is_file():
+                by_uuid[puuid].add_file("chats/" + _chat_rel(c), md, "chats")
+
+    if cowork_bundles is not None and cowork_bundles.is_dir():
+        history: _PlanProject | None = None
+        for b in sorted(d for d in cowork_bundles.iterdir() if (d / "manifest.json").is_file()):
+            try:
+                man = json.loads((b / "manifest.json").read_text(encoding="utf-8"))
+                task = json.loads((b / "task.json").read_text(encoding="utf-8")) if (b / "task.json").is_file() else {}
+            except (OSError, json.JSONDecodeError):
+                skipped.append({"name": f"Cowork task {b.name}", "reason": "unreadable manifest.json or task.json"})
+                continue
+            sid, sname = str(man.get("source_space_id") or ""), str(man.get("source_space_name") or "")
+            if sid in gone_space:
+                dropped[("Cowork task", gone_space[sid])] = dropped.get(("Cowork task", gone_space[sid]), 0) + 1
+                continue
+            target = by_space.get(sid) if sid else None
+            if target is None and sname:
+                # Same name as the space (chosen projects only); a migrated
+                # Cowork space wins over a plain project of that name.
+                same = sorted((p for p in plan_projects if p.source_name.lower() == sname.lower()),
+                              key=lambda p: (p.kind != "cowork-space", p.created_at))
+                target = same[0] if same else None
+                if target is None and sname.lower() in gone_names:
+                    dropped[("Cowork task", sname)] = dropped.get(("Cowork task", sname), 0) + 1
+                    continue
+            title = _safe_filename(task.get("title") or "", b.name)
+            md = b / "session.md"
+            if not md.is_file():
+                skipped.append({"name": f"Cowork task {title}", "reason": "bundle has no session.md"})
+                continue
+            rel = _dated_name(_ms_date(task.get("createdAt")), title)
+            if target is None:
+                if history is None:
+                    history = new_project("cowork-history", COWORK_HISTORY, COWORK_HISTORY, None, "cowork-history")
+                    history.set_instructions("Transcripts of Cowork tasks from the previous Claude account are in "
+                                             "the Library under cowork/. Read them when the user asks about past work.")
+                    plan_projects.append(history)
+                if sname:
+                    rel = f"{_safe_filename(sname, 'space')}/{rel}"
+                history.add_file("cowork/" + rel, md, "cowork")
+            else:
+                target.add_file("cowork/" + rel, md, "cowork")
+
+    for (what, proj), n in sorted(dropped.items(), key=lambda kv: (kv[0][1].lower(), kv[0][0])):
+        skipped.append({"name": f"{n} {what}(s) of {proj}", "reason": f"project {proj} was skipped"})
+
+    if include_unfiled_chats:
+        unfiled = [c for c in _read_chat_index(source)
+                   if not c.get("project_uuid") and org_ok(c.get("_org"))
+                   and (source / "conversations" / str(c["uuid"]) / "session.md").is_file()]
+        if unfiled:
+            ch = new_project("chat-history", CHAT_HISTORY, CHAT_HISTORY, None, "chat-history")
+            ch.set_instructions("Chats from the previous Claude account that were in no project are in the "
+                                "Library under chats/. Read them when the user asks about past conversations.")
+            for c in unfiled:
+                ch.add_file("chats/" + _chat_rel(c), source / "conversations" / str(c["uuid"]) / "session.md", "chats")
+            plan_projects.append(ch)
+
+    if include_account_memory:
+        am = new_project("account-memory", ACCOUNT_MEMORY, ACCOUNT_MEMORY, None, "account-memory")
+        am.set_instructions("Memory carried over from the previous Claude account "
+                            "(areas, topics, people, preferences, profile).")
+        am.add_memory_dir(source / "memory")
+        acct = source / "account"
+        for mf in sorted(acct.glob("*/memory.md")) if acct.is_dir() else []:
+            if org_ok(_org_of_dir(mf.parent)) and mf.stat().st_size:
+                am.add_memory(f"/account-memory-{_safe_filename(_org_of_dir(mf.parent), 'org')}.md", mf)
+        if am.memory:
+            plan_projects.append(am)
+
+    # Unique names (case-insensitive). The oldest plain project keeps the name;
+    # a Cowork space that collides becomes "<name> (Cowork)"; anything still
+    # colliding gets " (2)", " (3)". Done before --projects so a name never
+    # shifts between runs.
+    groups: dict[str, list[_PlanProject]] = {}
+    for p in plan_projects:
+        groups.setdefault(p.name.lower(), []).append(p)
+    taken = set(groups)
+    for same in groups.values():
+        if len(same) < 2:
+            continue
+        same.sort(key=lambda p: p.created_at)
+        plain = [p for p in same if p.kind != "cowork-space"]
+        keeper = plain[0] if plain else same[0]
+        for p in same:
+            if p is keeper:
+                continue
+            base = p.name
+            if p.kind == "cowork-space" and f"{base} (Cowork)".lower() not in taken:
+                p.name = f"{base} (Cowork)"
+            else:
+                n = 2
+                while f"{base} ({n})".lower() in taken:
+                    n += 1
+                p.name = f"{base} ({n})"
+            taken.add(p.name.lower())
+
+    chosen = [s.strip().lower() for s in projects or [] if s.strip()]
+    final: list[_PlanProject] = []
+    for p in plan_projects:
+        if chosen and "all" not in chosen and p.name.lower() not in chosen and p.source_name.lower() not in chosen:
+            continue
+        if p.empty and not include_empty:
+            skipped.append({"name": p.name, "reason": "empty (no instructions, files or memory)"})
+            continue
+        final.append(p)
+    final.sort(key=lambda p: (p.kind in _SYNTHETIC_KINDS, p.name.lower()))
+
+    totals: dict[str, int] = {"projects": len(final), "skipped": len(skipped)}
+    for k in ("docs", "files", "chats", "cowork", "memory", "bytes", "keys_removed"):
+        totals[k] = sum(p.counts[k] for p in final)
+    plan = {
+        "plan_version": PLAN_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source": str(source),
+        "options": {"cowork_bundles": str(cowork_bundles.resolve()) if cowork_bundles else None,
+                    "include_chats": include_chats, "include_unfiled_chats": include_unfiled_chats,
+                    "include_account_memory": include_account_memory, "orgs": list(orgs or []),
+                    "projects": list(projects or ["all"]), "include_empty": include_empty},
+        "projects": [p.to_json() for p in final],
+        "skipped": skipped,
+        "totals": totals,
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(plan, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return plan

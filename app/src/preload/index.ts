@@ -27,6 +27,7 @@ import type {
   InvokeChannelMap,
   NotionExportState,
   ProgressEvent,
+  PushProgress,
   Unsubscribe,
   WatcherState
 } from '../shared/ipc'
@@ -68,7 +69,12 @@ const CH = {
   claudeAiSignIn: 'claudeAi:signIn',
   claudeAiSignOut: 'claudeAi:signOut',
   claudeAiRunPull: 'claudeAi:runPull',
-  claudeAiCancel: 'claudeAi:cancel'
+  claudeAiCancel: 'claudeAi:cancel',
+  pushPlan: 'push:plan',
+  pushAccount: 'push:account',
+  pushDesktopStatus: 'push:desktopStatus',
+  pushRun: 'push:run',
+  pushCancel: 'push:cancel'
 } as const satisfies InvokeChannelMap
 
 const EV = {
@@ -80,7 +86,8 @@ const EV = {
   importAllProgress: 'evt:importAllProgress',
   claudeConsoleProgress: 'evt:claudeConsoleProgress',
   claudeAiStatus: 'evt:claudeAiStatus',
-  claudeAiPullProgress: 'evt:claudeAiPullProgress'
+  claudeAiPullProgress: 'evt:claudeAiPullProgress',
+  pushProgress: 'evt:pushProgress'
 } as const satisfies EventChannelMap
 
 function invoke<T>(channel: InvokeChannel, ...args: unknown[]): Promise<T> {
@@ -144,6 +151,7 @@ const importAllProgress = eventBridge<[ImportAllProgressEvent]>(EV.importAllProg
 const claudeConsoleProgress = eventBridge<[ClaudeConsoleProgress]>(EV.claudeConsoleProgress)
 const claudeAiStatus = eventBridge<[ClaudeAiSessionStatus]>(EV.claudeAiStatus)
 const claudeAiPullProgress = eventBridge<[ClaudeAiPullProgress]>(EV.claudeAiPullProgress)
+const pushProgress = eventBridge<[PushProgress]>(EV.pushProgress)
 
 const api: CoworkExporterApi = {
   tasksList: (req) => invoke(CH.tasksList, req),
@@ -183,6 +191,11 @@ const api: CoworkExporterApi = {
   claudeAiSignOut: () => invoke(CH.claudeAiSignOut),
   claudeAiRunPull: (req) => invoke(CH.claudeAiRunPull, req),
   claudeAiCancel: () => invoke(CH.claudeAiCancel),
+  pushPlan: (req) => invoke(CH.pushPlan, req),
+  pushAccount: (req) => invoke(CH.pushAccount, req),
+  pushDesktopStatus: () => invoke(CH.pushDesktopStatus),
+  pushRun: (req) => invoke(CH.pushRun, req),
+  pushCancel: () => invoke(CH.pushCancel),
 
   onTasksChanged: tasksChanged.on,
   offTasksChanged: tasksChanged.off,
@@ -201,7 +214,9 @@ const api: CoworkExporterApi = {
   onClaudeAiStatus: claudeAiStatus.on,
   offClaudeAiStatus: claudeAiStatus.off,
   onClaudeAiPullProgress: claudeAiPullProgress.on,
-  offClaudeAiPullProgress: claudeAiPullProgress.off
+  offClaudeAiPullProgress: claudeAiPullProgress.off,
+  onPushProgress: pushProgress.on,
+  offPushProgress: pushProgress.off
 }
 
 contextBridge.exposeInMainWorld('api', api)

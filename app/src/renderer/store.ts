@@ -315,7 +315,8 @@ export interface AppState {
    * wait for its download. Progress (elapsed, screenshot) lands in
    * consolePull via evt:claudeConsoleProgress. Never throws.
    */
-  runConsolePull(chats: PullChatsMode): Promise<MigrateOutcome<ClaudeConsolePullResult>>
+  /** `via: 'debugger'` runs the script through Claude Desktop's Main Process Debugger instead of typing. */
+  runConsolePull(chats: PullChatsMode, via?: 'console' | 'debugger'): Promise<MigrateOutcome<ClaudeConsolePullResult>>
   cancelConsolePull(): Promise<void>
   /** Re-check whether ClaudeLift's claude.ai session is signed in. Never throws. */
   refreshClaudeAiSession(): Promise<void>
@@ -828,7 +829,7 @@ export const useAppStore = create<AppState>()((set, get) => ({
     }
   },
 
-  runConsolePull: async (chats) => {
+  runConsolePull: async (chats, via = 'console') => {
     if (get().consolePull?.running === true || get().claudeAiPull?.running === true) {
       return { ok: false, error: { kind: 'validation', message: 'A pull is already running' } }
     }
@@ -838,7 +839,7 @@ export const useAppStore = create<AppState>()((set, get) => ({
     })
     try {
       const result = ClaudeConsolePullResultSchema.parse(
-        await window.api.claudeConsoleRunPull({ runId, chats })
+        await window.api.claudeConsoleRunPull({ runId, chats, via })
       )
       return { ok: true, result }
     } catch (err) {

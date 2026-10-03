@@ -27,6 +27,8 @@ Claude Desktop refuses to start with a remote-debugging port (`refusing to start
 3. Press **Run pull** on the DevTools route. ClaudeLift finds the claude.ai window, brings it to the front (it checks that the window really is in front and not covered before it types anything), types `allow pasting`, pastes the script, and restores your clipboard. A live picture of the console shows progress. Do not type in that window until it is done.
 4. The script saves `claudelift-pull-<run id>.json` to your Downloads folder. ClaudeLift picks it up and converts it.
 
+If no DevTools window is found (DevTools windows can lose their title after the page navigates), use **Developer → Enable Main Process Debugger** instead and press **Run pull through the debugger**. ClaudeLift then starts the same script in Claude Desktop's claude.ai page over the debugger on `127.0.0.1:9229`: no typing, no clipboard. Turn the debugger off again afterwards (or restart Claude Desktop).
+
 The script only sends `GET` requests with the session that is already signed in. It never sends your data anywhere but the downloaded file.
 
 You can also run it by hand: paste `scripts/pull-claude-projects.js` into the console (type `allow pasting` first if Chrome asks). It saves `claude-projects-full-<date>.json`.
@@ -77,7 +79,48 @@ claude-account/
   conversations/<chat id>/                       one importable bundle per chat; project chats carry space/space.json
 ```
 
-## Importing into the other account
+## Which kind of account is the target?
+
+Claude accounts now come in two layouts. Check the target before you import.
+
+| | Old layout | New layout |
+|---|---|---|
+| Projects | Cowork **spaces** in `spaces.json` on this PC, linked to claude.ai projects | Cloud **projects** ("channels"); nothing on this PC but `remote-session-spaces.json` |
+| Work inside a project | Cowork **tasks** (local files) | **Threads** that run in the cloud |
+| How ClaudeLift fills it | `import-all` (below) | **Rebuild projects in the new account** (Migrate card D, below) |
+
+The Migrate view marks a new-layout target with **new layout — use card D** and blocks the old-style import there unless you tick "Import old-style files anyway". Full details: [NEW-LAYOUT-SPEC.md](NEW-LAYOUT-SPEC.md).
+
+## Rebuilding projects in a new-layout account
+
+Migrate → **Rebuild projects in the new account**:
+
+1. **Make the plan.** Pick the converted account folder (it has `projects\`, `account\`, `conversations\`) and, if you have them, the exported Cowork task bundles. ClaudeLift runs `plan-push` and lists every project with its docs, files, chats, Cowork tasks, memory notes and size. Empty projects are left out. Credentials (API keys, tokens) are removed from memory notes and text files first.
+2. **Check the new account.** Either sign in to the new account inside ClaudeLift (sign out first if you pulled the old account there), or use Claude Desktop with **Developer → Enable Main Process Debugger** while it is signed in to the new account. **Check account** shows the email, the organization and the projects already there. This only reads.
+3. **Rebuild.** A dry run (on by default) says, per project, create / skip / finish, and writes nothing. Then turn off Dry run and press **Write N projects to <email>**. ClaudeLift stops if the page is signed in to another account.
+
+What lands where, per project:
+
+| Saved | New project |
+|---|---|
+| Name | Same name. A project whose name is already there is skipped. A Cowork space that has the same name as a claude.ai project becomes "<name> (Cowork)". |
+| Instructions | Project instructions (up to 16,000 characters; longer text is cut there and kept in full as `INSTRUCTIONS (full).md` in the Library) |
+| Knowledge docs | Library, top level |
+| Uploaded files (PDF, XLSX, …) | Library `files/` (files over 30 MB are listed as failed; add them by hand) |
+| Chats of the project | Library `chats/<date> <title>.md` (threads can read them; old chats cannot become threads) |
+| Cowork tasks of the space | Library `cowork/<date> <title>.md` |
+| Project memory | Memory notes (`cloud-memory.md` becomes `/project-memory.md`) |
+| Account memory | Project "Account memory (imported)" |
+| Cowork tasks with no space | Project "Cowork history (imported)" |
+| Chats in no project (optional) | Project "Chat history (imported)" |
+
+Every run writes a receipt to `<export folder>\push-receipts\` with every project, file and memory id it made. Run it again at any time: finished projects are skipped, and a project ClaudeLift made but did not finish is completed (only the missing files and notes are added). Nothing is ever deleted or replaced.
+
+From the command line, the plan is `python cowork_export.py plan-push --source .\claude-account --cowork-bundles .\account-move --org "My Org" --out .\push-plans\plan.json`. The write step needs a signed-in claude.ai page, so it runs from the app.
+
+Still by hand on the new account: your profile text (`account/profile.md` → Settings), custom skills and plugins (`account/<org>/custom-skills-upload/`, `plugins-upload/`, see `REINSTALL.md`).
+
+## Importing into an old-layout account
 
 1. Sign in to the other account in Claude Desktop once, so its Cowork folder exists.
 2. Quit Claude Desktop (tray icon → Quit).
