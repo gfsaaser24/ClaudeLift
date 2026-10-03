@@ -46,8 +46,12 @@ export const PUSH_PLANS_DIR = 'push-plans'
 export const WRITE_BATCH = 25
 /** files:list accepts limit 1–500 (501 → 400). */
 export const LIST_LIMIT = 500
-/** Larger files are not sent (claude.ai's upload limit); the user adds them by hand. */
-export const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+/**
+ * Larger files are not sent; the user adds them by hand. claude.ai allows
+ * 500 MB per Library file, but each upload goes through the page as one
+ * base64 string, so ClaudeLift stops at 150 MB.
+ */
+export const MAX_UPLOAD_BYTES = 150 * 1024 * 1024
 /** Uploads in flight at once. */
 const UPLOAD_CONCURRENCY = 3
 const MAX_LIST_PAGES = 100
@@ -151,13 +155,17 @@ export function decideAction(
   name: string,
   key: string,
   channels: readonly ChannelInfo[],
-  prior: ReadonlyMap<string, PriorRun>
+  prior: ReadonlyMap<string, PriorRun>,
+  topUp = false
 ): { action: PushAction; chan: string | null; reason: string | null } {
   const wanted = name.trim().toLowerCase()
   const live = channels.find((c) => !c.archived && c.name.trim().toLowerCase() === wanted)
   if (live === undefined) return { action: 'create', chan: null, reason: null }
   const before = prior.get(key)
   if (before !== undefined && before.chan === live.id) {
+    if (before.complete && topUp) {
+      return { action: 'resume', chan: live.id, reason: 'Made by ClaudeLift; adding what is new.' }
+    }
     return before.complete
       ? { action: 'skip', chan: live.id, reason: 'Already rebuilt by ClaudeLift.' }
       : { action: 'resume', chan: live.id, reason: 'Made by ClaudeLift earlier; adding what is missing.' }
@@ -470,7 +478,8 @@ class Api {
   }
 
   async memoryCount(chan: string): Promise<number> {
-    const res = await this.call('GET', `/v1/code/memory/channel/${chan}/memories`)
+    // The default page is 20 notes; the app itself asks for 100.
+    const res = await this.call('GET', `/v1/code/memory/channel/${chan}/memories?limit=100`)
     if (!res.ok) throw new PushError('crash', `Could not read the memory notes back (HTTP ${res.status}).`)
     const data = (res.j as { data?: unknown } | null)?.data
     return Array.isArray(data) ? data.length : 0
@@ -519,6 +528,8 @@ export interface PushRunOptions {
   onProgress: (event: PushProgress) => void
   /** Test hook for the 429 back-off wait. */
   sleep?: (ms: number) => Promise<void>
+  /** Resume finished ClaudeLift projects too (adds only what is missing). */
+  topUp?: boolean
 }
 
 function emptyResult(p: PushPlanProject, action: PushAction, chan: string | null, reason: string | null): ReceiptProject {
@@ -624,7 +635,7 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
       const index = i + 1
       current = { p, index }
       progress(p, index, 'checking')
-      const decision = decideAction(p.name, p.key, live, prior)
+      const decision = decideAction(p.name, p.key, live, prior, opts.topUp === true)
       const res = emptyResult(p, decision.action, decision.chan, decision.reason)
       receipt.projects.push(res)
       if (opts.dryRun || decision.action === 'skip') {
@@ -685,6 +696,32 @@ async function pushOne(
   }
   const chan = res.chan
   if (chan === null) throw new PushError('crash', 'No project id.')
+
+  // 1b. linked PC folders (as the Library's "Add folder" records them)
+  if (p.context_sources.length > 0) {
+    checkCancel()
+    const got = await api.call('GET', `/v1/code/channels/${chan}`)
+    const current = ((got.j as { channel?: { context_sources?: unknown } } | null)?.channel?.context_sources ?? []) as {
+      kind?: unknown
+      name?: unknown
+    }[]
+    const merged = current
+      .filter((c) => typeof c.kind === 'string' && typeof c.name === 'string')
+      .map((c) => ({ kind: c.kind as string, name: c.name as string }))
+    const have = new Set(merged.map((c) => `${c.kind}\u0000${c.name.toLowerCase()}`))
+    const add = p.context_sources.filter((c) => !have.has(`${c.kind}\u0000${c.name.toLowerCase()}`))
+    if (!got.ok) {
+      res.library.failed.push({ path: '(folders)', step: 'folders', status: got.status, error: apiErrorText(got.j) })
+    } else if (add.length > 0) {
+      progress(p, index, 'create', 0, 0, `${p.name}: linking folder(s) ${add.map((c) => c.name).join(', ')}`)
+      const patched = await api.call('PATCH', `/v1/code/channels/${chan}`, {
+        context_sources: [...merged, ...add.map((c) => ({ kind: c.kind, name: c.name }))]
+      })
+      if (!patched.ok) {
+        res.library.failed.push({ path: '(folders)', step: 'folders', status: patched.status, error: apiErrorText(patched.j) })
+      }
+    }
+  }
 
   // 2. instructions
   checkCancel()
@@ -751,12 +788,13 @@ async function pushOne(
       }
       for (const e of batch) {
         const r = byPath.get(libraryKey(e.path))
-        if (r === undefined || r.entry != null) {
-          // No per-file result on a 2xx answer counts as written (read-back verifies).
+        // With a results list, only a confirmed path counts: claude.ai answers
+        // 200 for paths it silently drops (e.g. control characters in a name).
+        if ((r === undefined && byPath.size === 0) || (r !== undefined && r.entry != null)) {
           res.library.written++
           res.files.push(e)
         } else {
-          fail({ path: e.path, step: 'write', status: w.status, error: apiErrorText(r.error) ?? 'not written' })
+          fail({ path: e.path, step: 'write', status: w.status, error: (r && apiErrorText(r.error)) ?? 'claude.ai did not confirm this path' })
         }
       }
     }
@@ -765,7 +803,7 @@ async function pushOne(
   const poolError: unknown = await pool(todo, UPLOAD_CONCURRENCY, async (f) => {
     checkCancel()
     if (f.size > MAX_UPLOAD_BYTES) {
-      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 30 MB. Add it to the project by hand.' })
+      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 150 MB. Add it to the project by hand.' })
     } else {
       let data: Buffer | null = null
       try {
@@ -852,5 +890,6 @@ function writtenOk(body: unknown, path: string): boolean {
   const r = (results as { path?: unknown; entry?: unknown }[]).find(
     (x) => typeof x.path === 'string' && libraryKey(x.path) === libraryKey(path)
   )
-  return r === undefined || r.entry != null
+  if (r === undefined) return results.length === 0
+  return r.entry != null
 }

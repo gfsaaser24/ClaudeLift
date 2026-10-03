@@ -447,12 +447,15 @@ class FakeClaude {
   files = new Map<string, string[]>()
   memories = new Map<string, unknown[]>()
   config = new Map<string, unknown>()
+  contextSources = new Map<string, unknown[]>()
   uploads: { name: string; uuid: string }[] = []
   email = 'new@example.com'
   /** files:write with more than one file answers 400. */
   failBatches = false
   /** files:write containing one of these paths answers 400. */
   failPaths = new Set<string>()
+  /** files:write answers 200 but leaves these paths out of its results (and does not store them). */
+  dropPaths = new Set<string>()
   memoryStatus = 200
   /** The next N project creates answer 429 "Too many projects created. Retry in 12s." */
   rateLimitedCreates = 0
@@ -484,6 +487,11 @@ class FakeClaude {
       this.files.set(id, [])
       return okJson({ channel: { id } }, 201)
     }
+    const one = /^\/v1\/code\/channels\/(chan_[^/]+)$/.exec(path)
+    if (one !== null) {
+      if (method === 'PATCH') this.contextSources.set(one[1], (body as { context_sources: unknown[] }).context_sources)
+      return okJson({ channel: { id: one[1], context_sources: this.contextSources.get(one[1]) ?? [] } })
+    }
     let m = /^\/v1\/code\/channels\/([^/]+)\/config$/.exec(path)
     if (m !== null) {
       if (method === 'PATCH') {
@@ -508,8 +516,9 @@ class FakeClaude {
       if ((this.failBatches && files.length > 1) || files.some((f) => this.failPaths.has(f.path))) {
         return okJson({ error: { message: 'bad entry' } }, 400)
       }
-      this.files.get(m[1])!.push(...files.map((f) => f.path))
-      return okJson({ results: files.map((f) => ({ path: f.path, entry: {} })) })
+      const kept = files.filter((f) => !this.dropPaths.has(f.path))
+      this.files.get(m[1])!.push(...kept.map((f) => f.path))
+      return okJson({ results: kept.map((f) => ({ path: f.path, entry: {} })) })
     }
     m = /^\/v1\/code\/channels\/([^/]+)\/files:list$/.exec(path)
     if (m !== null && method === 'POST') {
@@ -783,6 +792,54 @@ describe('pushPlan', () => {
     expect(res.cancelled).toBe(true)
   })
 
+  it('a path claude.ai leaves out of the files:write results counts as failed, not written', async () => {
+    const fake = new FakeClaude()
+    fake.dropPaths.add('/docs/p1-1.md')
+    const plan = planOf(await project('p1', 'Dropped', 3))
+    const res = await run(fake, plan)
+    expect(res.projects[0].library.written).toBe(2)
+    expect(res.projects[0].library.failed).toEqual([
+      expect.objectContaining({ path: '/docs/p1-1.md', step: 'write', error: 'claude.ai did not confirm this path' })
+    ])
+    expect(res.projects[0].complete).toBe(false)
+  })
+
+  it('links PC folders as local_folder context sources, keeping existing ones', async () => {
+    const fake = new FakeClaude()
+    const plan = planOf(
+      await project('p1', 'Folders', 1, {
+        context_sources: [
+          { kind: 'local_folder', name: 'Brain', path: String.raw`C:\x\Brain` },
+          { kind: 'local_folder', name: 'Old' }
+        ]
+      })
+    )
+    fake.contextSources.set('chan_X', [{ kind: 'local_folder', name: 'old', path: '', url: '' }])
+    const res = await run(fake, plan)
+    expect(res.projects[0].complete).toBe(true)
+    const patch = fake.calls.find((c) => c.method === 'PATCH' && c.path === '/v1/code/channels/chan_X')
+    expect(patch?.body).toEqual({
+      context_sources: [
+        { kind: 'local_folder', name: 'old' },
+        { kind: 'local_folder', name: 'Brain' }
+      ]
+    })
+  })
+
+  it('topUp resumes a finished ClaudeLift project and adds only new files', async () => {
+    const fake = new FakeClaude()
+    const first = planOf(await project('p1', 'Grows', 2))
+    await run(fake, first)
+    const grown = planOf(await project('p1', 'Grows', 4))
+    const skipped = await run(fake, grown)
+    expect(skipped.projects[0].action).toBe('skip')
+    const before = fake.uploads.length
+    const topped = await run(fake, grown, { topUp: true })
+    expect(topped.projects[0].action).toBe('resume')
+    expect(fake.uploads.length - before).toBe(2)
+    expect(topped.projects[0].library).toMatchObject({ written: 2, existing: 2 })
+  })
+
   it('a cancel during the 429 wait stops the run', async () => {
     const fake = new FakeClaude()
     fake.rateLimitedCreates = 5
@@ -859,7 +916,7 @@ describe('pushPlan', () => {
     expect(p.library.written).toBe(1)
     expect(p.library.failed).toHaveLength(1)
     expect(p.library.failed[0]).toMatchObject({ path: '/docs/p1-1.md', step: 'upload', status: null })
-    expect(p.library.failed[0].error).toMatch(/30 MB/)
+    expect(p.library.failed[0].error).toMatch(/150 MB/)
     expect(p.complete).toBe(false)
   })
 

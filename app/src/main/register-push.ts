@@ -165,6 +165,7 @@ export function registerPushHandlers(options: RegisterPushOptions): void {
         keys: req.keys,
         dryRun: req.dryRun,
         expectEmail: req.expectEmail ?? null,
+        topUp: req.topUp === true,
         outputDir: state.getSettings().outputDir,
         signal: abort.signal,
         onProgress: (progress) => sendToRenderer(EVENT_CHANNELS.pushProgress, progress)

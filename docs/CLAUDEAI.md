@@ -106,17 +106,24 @@ What lands where, per project:
 | Name | Same name. A project whose name is already there is skipped. A Cowork space that has the same name as a claude.ai project becomes "<name> (Cowork)". |
 | Instructions | Project instructions (up to 16,000 characters; longer text is cut there and kept in full as `INSTRUCTIONS (full).md` in the Library) |
 | Knowledge docs | Library, top level |
-| Uploaded files (PDF, XLSX, …) | Library `files/` (files over 30 MB are listed as failed; add them by hand) |
+| Uploaded files (PDF, XLSX, …) | Library `files/` (files over 150 MB are listed as failed; add them by hand. claude.ai allows up to 500 MB per file) |
 | Chats of the project | Library `chats/<date> <title>.md` (threads can read them; old chats cannot become threads) |
 | Cowork tasks of the space | Library `cowork/<date> <title>.md` |
 | Project memory | Memory notes (`cloud-memory.md` becomes `/project-memory.md`) |
 | Account memory | Project "Account memory (imported)" |
 | Cowork tasks with no space | Project "Cowork history (imported)" |
+| Linked PC folders (option "Linked PC folders") | The folder is recorded on the project (`context_sources: local_folder`) and its files go to the Library under `<folder name>/`, exactly like the Library's **Add folder**. Hidden folders, `node_modules`, caches and Office lock files are left out; credentials are blanked in text files. |
 | Chats in no project (optional) | Project "Chat history (imported)" |
 
-Every run writes a receipt to `<export folder>\push-receipts\` with every project, file and memory id it made. Run it again at any time: finished projects are skipped, and a project ClaudeLift made but did not finish is completed (only the missing files and notes are added). Nothing is ever deleted or replaced.
+File names are cleaned first: garbled characters (for example `â€™` for `’`) are repaired and control characters removed, because claude.ai answers OK for such names but does not store the file. A file counts as written only when claude.ai confirms its exact path.
 
-From the command line, the plan is `python cowork_export.py plan-push --source .\claude-account --cowork-bundles .\account-move --org "My Org" --out .\push-plans\plan.json`. The write step needs a signed-in claude.ai page, so it runs from the app.
+claude.ai limits each project's Library to 10 GB, 50,000 files and 500 MB per file. If claude.ai asks to slow down (it limits how fast new projects are made), the push waits as long as it asks and goes on.
+
+**Live folder links** (Project settings → environment → Add folder) are a separate thing: they let threads work in the folder on this PC through Claude Desktop. Claude Desktop allows only **6 linked folders per PC**, and each link needs the folder picker, so ClaudeLift does not make them. Link the folders you work in most by hand.
+
+Every run writes a receipt to `<export folder>\push-receipts\` with every project, file and memory id it made. Run it again at any time: finished projects are skipped, and a project ClaudeLift made but did not finish is completed (only the missing files and notes are added). Tick **Also add new files to projects ClaudeLift already made** to add, for example, folder files to projects made in an earlier run. Nothing is ever deleted or replaced.
+
+From the command line, the plan is `python cowork_export.py plan-push --source .\claude-account --cowork-bundles .\account-move --org "My Org" [--local-folders] --out .\push-plans\plan.json`. The write step needs a signed-in claude.ai page, so it runs from the app.
 
 Still by hand on the new account: your profile text (`account/profile.md` → Settings), custom skills and plugins (`account/<org>/custom-skills-upload/`, `plugins-upload/`, see `REINSTALL.md`).
 

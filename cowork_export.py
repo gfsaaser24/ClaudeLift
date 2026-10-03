@@ -3625,6 +3625,7 @@ def cmd_plan_push(args: argparse.Namespace) -> int:
         source, out, cowork_bundles=bundles, include_chats=not args.no_chats,
         include_unfiled_chats=args.include_unfiled_chats, include_account_memory=not args.no_account_memory,
         orgs=args.org, projects=names, include_empty=args.include_empty,
+        include_local_folders=args.local_folders,
     )
     print(json.dumps({"event": "done", "plan": str(out.resolve()), **plan["totals"]}, ensure_ascii=False), flush=True)
     return 0
@@ -3898,6 +3899,9 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--no-chats", action="store_true", help="leave out chat transcripts linked to projects")
     pp.add_argument("--include-unfiled-chats", action="store_true",
                     help="put chats that were in no project into a 'Chat history (imported)' project")
+    pp.add_argument("--local-folders", action="store_true",
+                    help="also put the files of each project's linked PC folder in its Library, under "
+                         "<folder name>/ (as the Library's Add folder does), and record the folder")
     pp.add_argument("--no-account-memory", action="store_true",
                     help="leave out the 'Account memory (imported)' project")
     pp.add_argument("--org", action="append", metavar="NAME", help="only projects of this organization (repeatable)")

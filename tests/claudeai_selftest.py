@@ -378,6 +378,37 @@ def main() -> int:
         print("[4] plan-push on a converted folder")
         test_plan_push(root / "plan-src", home)
 
+        print("[5] Library paths are cleaned")
+        sys.path.insert(0, str(REPO))
+        from claudeai_export import clean_library_path
+        garbled = "Talkin\u00e2\u0080\u0099 Paint Ep. 24.docx"
+        check(clean_library_path(garbled) == "Talkin\u2019 Paint Ep. 24.docx", "garbled UTF-8 repaired")
+        check(clean_library_path("files/a\u0007b\u009d.md") == "files/ab.md", "control characters removed")
+        check(clean_library_path("Caf\u00e9 notes.md") == "Caf\u00e9 notes.md", "real accents kept")
+        check(clean_library_path("chats/\u0001/x.md") == "chats/untitled/x.md", "empty segment named untitled")
+
+        print("[6] linked PC folder goes into the Library under its name")
+        from claudeai_export import _PlanProject
+        lf = root / "Brain Folder"
+        (lf / "sub").mkdir(parents=True)
+        (lf / ".obsidian").mkdir()
+        (lf / "node_modules").mkdir()
+        (lf / "a.md").write_text("hello", encoding="utf-8")
+        (lf / "sub" / "b.txt").write_text("key=" + "AIza" + "B" * 35, encoding="utf-8")
+        (lf / ".obsidian" / "x.json").write_text("{}", encoding="utf-8")
+        (lf / "node_modules" / "y.js").write_text("", encoding="utf-8")
+        (lf / "~$lock.docx").write_bytes(b"x")
+        pp = _PlanProject("k", "P", "P", None, "cowork-space", root / "stage-lf")
+        pp.add_local_folder(str(lf))
+        pp.add_local_folder(str(root / "missing-folder"))
+        paths = sorted(e["path"] for e in pp.library)
+        check(paths == ["Brain Folder/a.md", "Brain Folder/sub/b.txt"], f"only real files, under the folder name ({paths})")
+        check(pp.context_sources == [{"kind": "local_folder", "name": "Brain Folder", "path": str(lf)}], "folder recorded")
+        check(pp.counts["folder"] == 2 and pp.counts["keys_removed"] == 1, "counted, key blanked")
+        b = next(e for e in pp.library if e["path"].endswith("b.txt"))
+        check("AIza" not in Path(b["file"]).read_text(encoding="utf-8"), "uploaded copy has no key")
+        check(any("not found" in w for w in pp.warnings), "missing folder warned")
+
     print()
     if FAILURES:
         print(f"SELFTEST FAILED — {len(FAILURES)} failure(s):")

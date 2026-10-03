@@ -31,6 +31,7 @@ session fail; they are folded into readable text instead.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -1254,6 +1255,68 @@ def _dated_name(date: str, title: str) -> str:
     return f"{(date + ' ' if date else '')}{title}"[:120].rstrip(". ") + ".md"
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _fix_mojibake(s: str) -> str:
+    """UTF-8 text that was read as Latin-1 ("Talkinâ\\x80\\x99" -> "Talkin’"); other text unchanged."""
+    if not re.search(r"[\x80-\xff]", s):
+        return s
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
+def clean_library_path(rel: str) -> str:
+    """A Library path claude.ai stores as given: garbled UTF-8 repaired and
+    control characters removed in every segment (claude.ai answers OK for
+    such paths but does not store the file)."""
+    parts = []
+    for seg in rel.split("/"):
+        seg = _CONTROL_CHARS.sub("", _fix_mojibake(seg)).strip()
+        parts.append(seg or "untitled")
+    return "/".join(parts)
+
+
+# Local folders: folders and files never copied to the Library.
+FOLDER_SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "site-packages"}
+FOLDER_SKIP_FILES = {"desktop.ini", "thumbs.db", ".ds_store"}
+
+
+def _project_folders(meta: dict[str, Any], pdir: Path) -> list[str]:
+    """PC folders a project (Cowork space) was linked to, oldest record first."""
+    found: list[str] = []
+    bound = _find_key(meta.get("_pull"), "cowork_bound_device")
+    if isinstance(bound, dict):
+        found += [f for f in bound.get("folders") or [] if isinstance(f, str)]
+    sp = pdir / "space.json"
+    if sp.is_file():
+        try:
+            for f in json.loads(sp.read_text(encoding="utf-8")).get("folders") or []:
+                path = f if isinstance(f, str) else (f.get("path") if isinstance(f, dict) else None)
+                if isinstance(path, str):
+                    found.append(path)
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+    out: list[str] = []
+    for f in found:
+        if f.lower() not in (x.lower() for x in out):
+            out.append(f)
+    return out
+
+
+def _folder_files(root: Path) -> Iterator[Path]:
+    """Files of a local folder for the Library: hidden folders/files, caches
+    and Office lock files are left out."""
+    for dp, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.lower() not in FOLDER_SKIP_DIRS)
+        for f in sorted(files):
+            if f.startswith(".") or f.startswith("~$") or f.lower() in FOLDER_SKIP_FILES:
+                continue
+            yield Path(dp) / f
+
+
 class _PlanProject:
     """One project of a push plan while it is being built. Blanked copies go
     to ``<staging>/<n><suffix>`` (short names: Windows path limits); the
@@ -1267,10 +1330,12 @@ class _PlanProject:
         self.instructions = ""
         self.library: list[dict[str, Any]] = []
         self.memory: list[dict[str, Any]] = []
-        self.counts = {"docs": 0, "files": 0, "chats": 0, "cowork": 0, "memory": 0, "bytes": 0, "keys_removed": 0}
+        self.counts = {"docs": 0, "files": 0, "chats": 0, "cowork": 0, "folder": 0, "memory": 0, "bytes": 0,
+                       "keys_removed": 0}
         self.warnings: list[str] = []
         self._paths: set[str] = set()
         self._staged = 0
+        self.context_sources: list[dict[str, str]] = []
 
     def _unique(self, rel: str) -> str:
         if rel.lower() not in self._paths:
@@ -1295,7 +1360,7 @@ class _PlanProject:
 
     def add_file(self, rel: str, file: Path, category: str) -> None:
         ce = _engine()
-        rel = self._unique(rel)
+        rel = self._unique(clean_library_path(rel))
         try:
             sniffed = ce.sniff_text(file)
             n = 0
@@ -1372,10 +1437,28 @@ class _PlanProject:
     def empty(self) -> bool:
         return not (self.instructions.strip() or self.library or self.memory)
 
+    def add_local_folder(self, folder: str) -> None:
+        """A linked PC folder, the way the Library's "Add folder" does it: a
+        `local_folder` context source named after the folder, and its files
+        under `<name>/` in the Library."""
+        root = Path(folder)
+        if not root.is_dir():
+            self.warnings.append(f"Local folder not found, left out: {folder}")
+            return
+        name = clean_library_path(_safe_filename(root.name, "folder"))
+        taken = {c["name"].lower() for c in self.context_sources}
+        base, n = name, 2
+        while name.lower() in taken:
+            name, n = f"{base} ({n})", n + 1
+        self.context_sources.append({"kind": "local_folder", "name": name, "path": str(root)})
+        for f in _folder_files(root):
+            self.add_file(f"{name}/{f.relative_to(root).as_posix()}", f, "folder")
+
     def to_json(self) -> dict[str, Any]:
         return {"key": self.key, "name": self.name, "source_name": self.source_name, "org": self.org,
                 "kind": self.kind, "instructions": self.instructions, "library": self.library,
-                "memory": self.memory, "counts": self.counts, "warnings": self.warnings, "empty": self.empty}
+                "memory": self.memory, "context_sources": self.context_sources,
+                "counts": self.counts, "warnings": self.warnings, "empty": self.empty}
 
 
 def _read_chat_index(source: Path) -> list[dict[str, Any]]:
@@ -1411,6 +1494,7 @@ def build_push_plan(
     orgs: list[str] | None = None,
     projects: list[str] | None = None,
     include_empty: bool = False,
+    include_local_folders: bool = False,
 ) -> dict[str, Any]:
     """Read a converted folder (``convert-claudeai`` output) and write a push
     plan: one entry per project to create in a new-layout account, with its
@@ -1481,6 +1565,9 @@ def build_push_plan(
                 if f.is_file():
                     p.add_file(prefix + f.relative_to(d).as_posix(), f, cat)
         p.add_memory_dir(pdir / "memory")
+        if include_local_folders:
+            for folder in _project_folders(meta, pdir):
+                p.add_local_folder(folder)
         plan_projects.append(p)
         by_uuid[puuid] = p
         if space_id:
@@ -1604,7 +1691,7 @@ def build_push_plan(
     final.sort(key=lambda p: (p.kind in _SYNTHETIC_KINDS, p.name.lower()))
 
     totals: dict[str, int] = {"projects": len(final), "skipped": len(skipped)}
-    for k in ("docs", "files", "chats", "cowork", "memory", "bytes", "keys_removed"):
+    for k in ("docs", "files", "chats", "cowork", "folder", "memory", "bytes", "keys_removed"):
         totals[k] = sum(p.counts[k] for p in final)
     plan = {
         "plan_version": PLAN_VERSION,
@@ -1613,7 +1700,8 @@ def build_push_plan(
         "options": {"cowork_bundles": str(cowork_bundles.resolve()) if cowork_bundles else None,
                     "include_chats": include_chats, "include_unfiled_chats": include_unfiled_chats,
                     "include_account_memory": include_account_memory, "orgs": list(orgs or []),
-                    "projects": list(projects or ["all"]), "include_empty": include_empty},
+                    "projects": list(projects or ["all"]), "include_empty": include_empty,
+                    "include_local_folders": include_local_folders},
         "projects": [p.to_json() for p in final],
         "skipped": skipped,
         "totals": totals,
