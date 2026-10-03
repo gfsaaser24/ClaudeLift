@@ -24,6 +24,13 @@ import { taskFromEngine, type CoworkTask, type TaskSource } from '../shared/ipc'
 /** Longest an engine invocation may run before we kill it. */
 const ENGINE_TIMEOUT_MS = 120_000
 
+/** convert-claudeai walks a whole account export — allow it much longer. */
+const CONVERT_TIMEOUT_MS = 30 * 60_000
+
+/** `convert-claudeai --what` parts accepted by the engine. */
+export const CLAUDEAI_PARTS = ['conversations', 'projects', 'memory', 'design', 'artifacts'] as const
+export type ClaudeAiPart = (typeof CLAUDEAI_PARTS)[number]
+
 /** Cap on retained stderr (bytes) — engines can be chatty; we only surface the first line. */
 const STDERR_CAP = 256 * 1024
 
@@ -106,8 +113,8 @@ let engineQueue: Promise<unknown> = Promise.resolve()
  * rejects on a non-zero exit — callers decide what a given exit code means
  * (see `ensureOk`). Rejects only on spawn failure or the 120s timeout.
  */
-export function runEngine(args: string[]): Promise<RunResult> {
-  const run = (): Promise<RunResult> => spawnEngine(args)
+export function runEngine(args: string[], timeoutMs: number = ENGINE_TIMEOUT_MS): Promise<RunResult> {
+  const run = (): Promise<RunResult> => spawnEngine(args, timeoutMs)
   const result = engineQueue.then(run, run)
   // Keep the chain alive regardless of this call's outcome.
   engineQueue = result.then(
@@ -131,7 +138,7 @@ function killTree(child: ReturnType<typeof spawn>): void {
   })
 }
 
-function spawnEngine(args: string[]): Promise<RunResult> {
+function spawnEngine(args: string[], timeoutMs: number): Promise<RunResult> {
   const exe = resolveEngineExe()
   return new Promise<RunResult>((resolvePromise, rejectPromise) => {
     let child: ReturnType<typeof spawn>
@@ -150,8 +157,8 @@ function spawnEngine(args: string[]): Promise<RunResult> {
       if (settled) return
       settled = true
       killTree(child)
-      rejectPromise(new Error(`engine timed out after ${ENGINE_TIMEOUT_MS / 1000}s: ${args.join(' ')}`))
-    }, ENGINE_TIMEOUT_MS)
+      rejectPromise(new Error(`engine timed out after ${timeoutMs / 1000}s: ${args.join(' ')}`))
+    }, timeoutMs)
     timer.unref()
 
     child.stdout?.setEncoding('utf8')
@@ -344,6 +351,74 @@ export async function importBundle(
     stdout: result.stdout,
     dryRun: opts.dryRun === true
   }
+}
+
+export interface ConvertClaudeAiOptions {
+  exportPath: string
+  outputDir: string
+  what?: ClaudeAiPart[]
+  since?: string
+  match?: string
+  limit?: number
+}
+
+export interface ConvertClaudeAiSummary {
+  output: string
+  conversations: number
+  projects: number
+  memory_files: number
+  design_chats: number
+  artifact_files: number
+}
+
+/**
+ * Convert a claude.ai "Export data" download (folder of zips, extracted
+ * folder, or a single zip) into bundles under `outputDir`. Writes ONLY
+ * inside `outputDir` — nothing in Cowork or the export is touched. Runs
+ * with `--progress-json` and returns the final `done` event's counts.
+ */
+export async function convertClaudeAi(opts: ConvertClaudeAiOptions): Promise<ConvertClaudeAiSummary> {
+  const source = resolve(opts.exportPath)
+  if (!existsSync(source)) throw new Error(`export not found: ${source}`)
+  const out = resolve(opts.outputDir)
+  await mkdir(out, { recursive: true })
+  // Absolute paths never start with '-'; `--opt=value` keeps a dash-led
+  // filter from being parsed as a flag.
+  const args = ['convert-claudeai', source, '-o', out, '--formats=md']
+  if (opts.what !== undefined && opts.what.length > 0) args.push(`--what=${opts.what.join(',')}`)
+  if (opts.since !== undefined && opts.since.length > 0) args.push(`--since=${opts.since}`)
+  if (opts.match !== undefined && opts.match.length > 0) args.push(`--match=${opts.match}`)
+  if (opts.limit !== undefined) args.push(`--limit=${opts.limit}`)
+  args.push('--progress-json')
+  const result = await runEngine(args, CONVERT_TIMEOUT_MS)
+  if (result.code !== 0) {
+    const detail = fullStderr(result.stderr)
+    throw new Error(`engine convert-claudeai failed (exit ${result.code})${detail ? `:\n${detail}` : ''}`)
+  }
+  for (const raw of result.stdout.split(/\r?\n/).reverse()) {
+    const line = raw.trim()
+    if (!line.startsWith('{')) continue
+    let event: Record<string, unknown>
+    try {
+      event = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      continue // not an event line
+    }
+    if (event.event !== 'done') continue
+    const num = (key: string): number => {
+      const value = event[key]
+      return typeof value === 'number' ? value : 0
+    }
+    return {
+      output: typeof event.output === 'string' ? event.output : out,
+      conversations: num('conversations'),
+      projects: num('projects'),
+      memory_files: num('memory_files'),
+      design_chats: num('design_chats'),
+      artifact_files: num('artifact_files')
+    }
+  }
+  throw new Error('engine convert-claudeai finished without a done event')
 }
 
 /**

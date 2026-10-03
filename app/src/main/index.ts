@@ -9,6 +9,7 @@
 import { app, BrowserWindow, Notification, dialog, ipcMain, screen, shell } from 'electron'
 import { join } from 'node:path'
 import { EVENT_CHANNELS, type EventChannel } from '../shared/ipc'
+import { cancelPull } from './devtools-bridge'
 import { EngineService } from './engine'
 import { registerAllHandlers, watcherRootsOverride } from './ipc-handlers'
 import { getStateStore, type StateStore } from './state'
@@ -278,6 +279,7 @@ if (!gotLock) {
       // live engine child is killed whatever command it is running
       // (import/seed/list included), regardless of export tag.
       engine.shutdown()
+      cancelPull()
       void watcher.stop().finally(() => app.quit())
     })
   })

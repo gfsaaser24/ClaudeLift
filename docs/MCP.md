@@ -49,7 +49,7 @@ You do **not** need Node, Python, or the command line installed. The server borr
 
 ## 🧰 Tools
 
-Six tools, all prefixed `claudelift_`. Four are read-only; `claudelift_export_task` only ever creates bundle files, and `claudelift_import_bundle` can restore a bundle into your local Cowork data — but it defaults to a **dry run** and never deletes anything.
+Seven tools, all prefixed `claudelift_`. Four are read-only; `claudelift_export_task` and `claudelift_convert_claudeai` only ever create bundle files, and `claudelift_import_bundle` can restore a bundle into your local Cowork data — but it defaults to a **dry run** and never deletes anything.
 
 | Tool | What it does | Key params | Read-only? |
 |---|---|---|---|
@@ -59,11 +59,13 @@ Six tools, all prefixed `claudelift_`. Four are read-only; `claudelift_export_ta
 | **`claudelift_list_bundles`** | Lists previously exported bundles in a directory — task id, title, export time, size, and which session formats were written. | `output_dir?` (defaults to `Documents/CoworkExports`), `response_format` `markdown`\|`json` (default `markdown`) | ✅ Yes |
 | **`claudelift_export_task`** | Runs a real export of a chat into a bundle directory on disk, including uploaded and generated files, plus a manifest and transcript. Returns the bundle path and a manifest summary. | `task_id` (required), `formats[]` any of `html`,`md`,`json`,`csv` (default: all four), `output_dir?` (defaults to `Documents/CoworkExports`) | ✍️ Writes files (non-destructive) |
 | **`claudelift_import_bundle`** | Restores an exported bundle back into your local Cowork data as a new chat — rewriting paths for this machine. **Defaults to a dry run** that only prints the plan; call again with `dry_run=false` to actually write. Never deletes or overwrites existing data (use `force` to replace a colliding task id). | `bundle_dir` (required), `dry_run` (default `true`), `workspace?`, `remaps[]` `{from,to}` (for `userSelectedFolders`), `keep_task_id?`, `force?` | ⚠️ Dry-run by default; writes only when `dry_run=false` |
+| **`claudelift_convert_claudeai`** | Converts a claude.ai data export (the folder with `conversations-*.zip`, `projects-*.zip`, `memories-*.zip`) into bundles: one importable bundle per chat, one space bundle per project (instructions, knowledge docs, project memory), and account memory. Import the result with the desktop app's Migrate view. | `export_path` (required), `output_dir?` (defaults to `Documents/CoworkExports/claudeai`), `what[]` any of `conversations`,`projects`,`memory`,`design`,`artifacts`, `since?`, `match?`, `limit?` | ✍️ Writes files (non-destructive) |
 
 **Notes**
 
 - `claudelift_get_transcript` and `claudelift_seed_prompt` cap their output at **25,000 characters** and truncate with a note when a chat runs longer — export the task to a bundle to read the full content.
 - `claudelift_import_bundle` is **dry-run by default**: the first call just prints the plan (target workspace, the new task id it would create, any path remaps). Review it, then call again with `dry_run=false` to write. If the bundle references machine-local folders (`userSelectedFolders`), the engine asks for a `remaps` entry; if more than one Cowork workspace exists, it asks for a `workspace` — pass those and retry.
+- A real (`dry_run=false`) `claudelift_import_bundle` call is refused while Claude Desktop is running, because the app keeps spaces and task lists in memory and would overwrite the import. Run imports from Claude Code or Cursor with Claude Desktop quit, or use the desktop app's Migrate view.
 - Where a param has a default, you can omit it. `task_id` is always the full id returned by `claudelift_list_tasks`.
 
 ### Deliberately not exposed
@@ -76,7 +78,7 @@ To keep the server safe-by-default, the following stay in the desktop app and ar
 
 ### Easiest: the `.mcpb` extension (Claude Desktop)
 
-Download **`ClaudeLift-0.5.0.mcpb`** from the [latest release](https://github.com/gfsaaser24/ClaudeLift/releases/latest) and **double-click it** — or drag it into Claude Desktop, or go to **Settings → Extensions → Advanced → Install Extension**. Claude Desktop runs it with its own bundled Node, so there's nothing else to install. On the extension's config screen, confirm the **engine path** (pre-filled to the standard install location, `%LOCALAPPDATA%\Programs\ClaudeLift\resources\engine\cowork-export\cowork-export.exe`). Requires ClaudeLift to be installed.
+Download **`ClaudeLift-0.6.0.mcpb`** from the [latest release](https://github.com/gfsaaser24/ClaudeLift/releases/latest) and **double-click it** — or drag it into Claude Desktop, or go to **Settings → Extensions → Advanced → Install Extension**. Claude Desktop runs it with its own bundled Node, so there's nothing else to install. On the extension's config screen, confirm the **engine path** (pre-filled to the standard install location, `%LOCALAPPDATA%\Programs\ClaudeLift\resources\engine\cowork-export\cowork-export.exe`). Requires ClaudeLift to be installed.
 
 > The app's **Settings → MCP server** card also has an **Add to Claude Desktop** button that writes the config for you.
 
@@ -184,6 +186,6 @@ That's expected for long chats — output is capped at 25,000 characters and tru
 
 The MCP server is designed to be **read-first and local-only**:
 
-- **Read-first surface.** Four of the six tools are read-only. `claudelift_export_task` only ever creates bundle files on disk. `claudelift_import_bundle` can write into your local Cowork data, but it **defaults to a dry run** (plan only), never deletes, and never overwrites an existing task unless you explicitly pass `force`. No tool purges your Cowork copy, bundles auth artefacts (`--include-auth`), or publishes to Notion — those higher-risk actions stay in the desktop app on purpose.
+- **Read-first surface.** Four of the seven tools are read-only. `claudelift_export_task` and `claudelift_convert_claudeai` only ever create bundle files on disk. `claudelift_import_bundle` can write into your local Cowork data, but it **defaults to a dry run** (plan only), never deletes, and never overwrites an existing task unless you explicitly pass `force`. No tool purges your Cowork copy, bundles auth artefacts (`--include-auth`), or publishes to Notion — those higher-risk actions stay in the desktop app on purpose.
 - **Local stdio, no network.** Each client spawns its own copy of the server and talks to it over stdin/stdout. Nothing listens on a network port; nothing is exposed to other machines.
 - **Treat access like file access to your Cowork data.** Transcripts and exports can contain sensitive chat content, uploaded files, and generated output. Anything that can spawn this server can read those chats — so only add it to MCP clients you trust, exactly as you'd guard read access to the underlying files on disk.

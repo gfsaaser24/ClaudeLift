@@ -22,8 +22,20 @@ import { z } from 'zod'
 import {
   AppSettingsSchema,
   BundleInfoSchema,
+  ClaudeAiPullProgressSchema,
+  ClaudeAiPullResultSchema,
+  ClaudeAiSessionStatusSchema,
+  ClaudeConsoleInfoSchema,
+  ClaudeConsoleProgressSchema,
+  ClaudeConsolePullResultSchema,
+  ConvertProgressEventSchema,
+  ConvertResultSchema,
+  DESKTOP_RUNNING_MARKER,
   DiagnosticsSchema,
   ExportResultSchema,
+  ImportAllProgressEventSchema,
+  ImportAllResultSchema,
+  ListWorkspacesResultSchema,
   NotionExportStateSchema,
   NotionStatusSchema,
   ProgressEventSchema,
@@ -34,16 +46,30 @@ import type {
   AppSettings,
   AppSettingsPatch,
   BundleInfo,
+  ClaudeAiPullProgress,
+  ClaudeAiPullResult,
+  ClaudeAiSessionStatus,
+  ClaudeConsoleInfo,
+  ClaudeConsoleProgress,
+  ClaudeConsolePullResult,
+  ConvertClaudeAiOptions,
+  ConvertProgressEvent,
+  ConvertResult,
   CoworkTask,
   Diagnostics,
   ExportOptions,
+  ImportAllOptions,
+  ImportAllProgressEvent,
+  ImportAllResult,
   NotionExportRequest,
   NotionExportState,
   NotionStatus,
   ProgressEvent,
+  PullChatsMode,
   TaskSource,
   TasksListRequest,
-  WatcherState
+  WatcherState,
+  WorkspaceInfo
 } from '../shared/ipc'
 
 // ---------------------------------------------------------------------------
@@ -75,6 +101,16 @@ export function parseIpcError(err: unknown): EngineErrorInfo | null {
   }
 }
 
+/**
+ * True when the engine refused to write because Claude Desktop is running
+ * (exit 3 from import / import-all / import-space without --allow-running).
+ */
+export function isDesktopRunningError(info: EngineErrorInfo | null): boolean {
+  if (info === null) return false
+  return `${info.message}
+${info.stderr ?? ''}`.includes(DESKTOP_RUNNING_MARKER)
+}
+
 /** Human-readable message for any thrown value (engine-aware). */
 export function errorText(err: unknown): string {
   const info = parseIpcError(err)
@@ -87,7 +123,7 @@ export function errorText(err: unknown): string {
 // Store types
 // ---------------------------------------------------------------------------
 
-export type ViewName = 'tasks' | 'bundles' | 'notion' | 'settings'
+export type ViewName = 'tasks' | 'bundles' | 'migrate' | 'notion' | 'settings'
 
 export type ToastKind = 'info' | 'success' | 'error'
 
@@ -123,6 +159,51 @@ export interface ExportModalState {
  */
 export const EXPORT_BATCH_KEY = '__batch__'
 
+/** Which Migrate-view flow owns the running/last migrate job. */
+export type MigrateOwner = 'cowork' | 'claudeai' | 'account'
+
+/** Result of a migrate action: the engine result, or the structured error. */
+export type MigrateOutcome<T> =
+  | { ok: true; result: T }
+  | { ok: false; error: EngineErrorInfo }
+
+export interface MigrateJob {
+  kind: 'convert' | 'importAll'
+  owner: MigrateOwner
+}
+
+/** The DevTools account pull (Migrate card C) — live while running, last state after. */
+export interface ConsolePullState {
+  runId: string
+  running: boolean
+  phase: ClaudeConsoleProgress['phase']
+  elapsedSec: number
+  /** Latest console screenshot (base64 PNG); kept when a tick has none. */
+  screenshot: string | null
+  fileBytes: number | null
+}
+
+/** The sign-in route's account pull (Migrate card C) — live while running, last state after. */
+export interface ClaudeAiPullState {
+  runId: string
+  running: boolean
+  phase: ClaudeAiPullProgress['phase']
+  elapsedSec: number
+  fileBytes: number | null
+  /** `[pull]` console lines of the pull script, oldest first (capped). */
+  lines: string[]
+}
+
+/** Keep at most this many pull log lines in the store. */
+const PULL_LOG_MAX_LINES = 500
+
+/** Unique-enough id for one pull run (also part of the download's file name). */
+function newPullRunId(): string {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, '').replace('T', '-')
+  const rand = Math.random().toString(36).slice(2, 8)
+  return `${stamp}-${rand}`
+}
+
 export interface AppState {
   view: ViewName
   tasks: CoworkTask[]
@@ -141,6 +222,22 @@ export interface AppState {
   notion: NotionStatus | null
   notionLog: NotionExportState[]
   toasts: Toast[]
+  /** The convert-claudeai / import-all job currently running, if any. */
+  migrateJob: MigrateJob | null
+  /** evt:convertProgress events of the latest convert run, in order. */
+  convertProgress: ConvertProgressEvent[]
+  /** evt:importAllProgress events of the latest import-all run, in order. */
+  importAllProgress: ImportAllProgressEvent[]
+  /** Which flow started the latest import-all (its progress belongs there). */
+  importAllOwner: MigrateOwner | null
+  /** DevTools account pull state (null before the first run). */
+  consolePull: ConsolePullState | null
+  /** ClaudeLift's own claude.ai session (null before the first check). */
+  claudeAiSession: ClaudeAiSessionStatus | null
+  /** True while a status check is in flight. */
+  claudeAiSessionChecking: boolean
+  /** Sign-in route account pull state (null before the first run). */
+  claudeAiPull: ClaudeAiPullState | null
 
   /**
    * One-time app wiring: loadSettings → refreshTasks + refreshBundles +
@@ -193,6 +290,46 @@ export interface AppState {
   notionSetParentPage(url: string): Promise<void>
   notionExport(req: NotionExportRequest): Promise<void>
   notionRetry(taskId: string): Promise<void>
+  /** Enumerate target workspaces (settings root override honored by main). */
+  listWorkspaces(): Promise<WorkspaceInfo[]>
+  /**
+   * Run convert-claudeai. Clears convertProgress (re-filled by the
+   * evt:convertProgress subscription); resolves with the counts or the
+   * structured error (cancel = kind 'aborted'). Never throws.
+   */
+  runConvertClaudeAi(
+    opts: ConvertClaudeAiOptions,
+    owner?: MigrateOwner
+  ): Promise<MigrateOutcome<ConvertResult>>
+  /**
+   * Run import-all for `owner`'s flow. Clears importAllProgress; resolves
+   * with the counts or the structured error (Claude Desktop running →
+   * isDesktopRunningError). Refreshes tasks on a real import. Never throws.
+   */
+  runImportAll(owner: MigrateOwner, opts: ImportAllOptions): Promise<MigrateOutcome<ImportAllResult>>
+  cancelMigrate(): Promise<void>
+  /** Read-only probe for the claude.ai DevTools window; null on IPC failure. */
+  findClaudeConsole(): Promise<ClaudeConsoleInfo | null>
+  /**
+   * Type the account-pull script into the claude.ai DevTools console and
+   * wait for its download. Progress (elapsed, screenshot) lands in
+   * consolePull via evt:claudeConsoleProgress. Never throws.
+   */
+  runConsolePull(chats: PullChatsMode): Promise<MigrateOutcome<ClaudeConsolePullResult>>
+  cancelConsolePull(): Promise<void>
+  /** Re-check whether ClaudeLift's claude.ai session is signed in. Never throws. */
+  refreshClaudeAiSession(): Promise<void>
+  /** Open the "Sign in to claude.ai" window (status updates arrive by event). */
+  claudeAiSignIn(): Promise<void>
+  /** Remove the claude.ai sign-in stored in ClaudeLift. */
+  claudeAiSignOut(): Promise<void>
+  /**
+   * Pull the account in a hidden claude.ai window of ClaudeLift's session.
+   * `[pull]` lines and phases land in claudeAiPull via
+   * evt:claudeAiPullProgress. Never throws.
+   */
+  runClaudeAiPull(chats: PullChatsMode): Promise<MigrateOutcome<ClaudeAiPullResult>>
+  cancelClaudeAiPull(): Promise<void>
   pushToast(kind: ToastKind, text: string): void
   dismissToast(id: number): void
   /**
@@ -242,6 +379,14 @@ export const useAppStore = create<AppState>()((set, get) => ({
   notion: null,
   notionLog: [],
   toasts: [],
+  migrateJob: null,
+  convertProgress: [],
+  importAllProgress: [],
+  importAllOwner: null,
+  consolePull: null,
+  claudeAiSession: null,
+  claudeAiSessionChecking: false,
+  claudeAiPull: null,
 
   initApp: async () => {
     if (appWired) return
@@ -252,6 +397,11 @@ export const useAppStore = create<AppState>()((set, get) => ({
     window.api.offExportProgress()
     window.api.offNotionProgress()
     window.api.offWatcherState()
+    window.api.offConvertProgress()
+    window.api.offImportAllProgress()
+    window.api.offClaudeConsoleProgress()
+    window.api.offClaudeAiStatus()
+    window.api.offClaudeAiPullProgress()
 
     window.api.onTasksChanged(() => {
       void get().refreshTasks(true)
@@ -289,6 +439,60 @@ export const useAppStore = create<AppState>()((set, get) => ({
       const parsed = WatcherStateSchema.safeParse(raw)
       if (!parsed.success) return
       set({ watcher: parsed.data })
+    })
+
+    window.api.onConvertProgress((raw) => {
+      const parsed = ConvertProgressEventSchema.safeParse(raw)
+      if (!parsed.success) return
+      set((s) => ({ convertProgress: [...s.convertProgress, parsed.data] }))
+    })
+
+    window.api.onImportAllProgress((raw) => {
+      const parsed = ImportAllProgressEventSchema.safeParse(raw)
+      if (!parsed.success) return
+      set((s) => ({ importAllProgress: [...s.importAllProgress, parsed.data] }))
+    })
+
+    window.api.onClaudeConsoleProgress((raw) => {
+      const parsed = ClaudeConsoleProgressSchema.safeParse(raw)
+      if (!parsed.success) return
+      const evt = parsed.data
+      set((s) => {
+        if (s.consolePull === null || s.consolePull.runId !== evt.runId || !s.consolePull.running) return {}
+        return {
+          consolePull: {
+            ...s.consolePull,
+            phase: evt.phase,
+            elapsedSec: evt.elapsedSec,
+            fileBytes: evt.fileBytes,
+            screenshot: evt.screenshot ?? s.consolePull.screenshot
+          }
+        }
+      })
+    })
+
+    window.api.onClaudeAiStatus((raw) => {
+      const parsed = ClaudeAiSessionStatusSchema.safeParse(raw)
+      if (!parsed.success) return
+      const prev = get().claudeAiSession
+      set({ claudeAiSession: parsed.data })
+      if (parsed.data.signedIn && prev?.signedIn !== true) {
+        get().pushToast('success', 'Signed in to claude.ai')
+      }
+    })
+
+    window.api.onClaudeAiPullProgress((raw) => {
+      const parsed = ClaudeAiPullProgressSchema.safeParse(raw)
+      if (!parsed.success) return
+      const evt = parsed.data
+      set((s) => {
+        const cur = s.claudeAiPull
+        if (cur === null || cur.runId !== evt.runId || !cur.running) return {}
+        const lines = evt.line === null ? cur.lines : [...cur.lines, evt.line].slice(-PULL_LOG_MAX_LINES)
+        return {
+          claudeAiPull: { ...cur, phase: evt.phase, elapsedSec: evt.elapsedSec, fileBytes: evt.fileBytes, lines }
+        }
+      })
     })
 
     await get().loadSettings()
@@ -549,6 +753,166 @@ export const useAppStore = create<AppState>()((set, get) => ({
       await window.api.notionRetry({ taskId })
     } catch (err) {
       get().pushToast('error', `Notion retry failed: ${errorText(err)}`)
+    }
+  },
+
+  listWorkspaces: async () => {
+    try {
+      return ListWorkspacesResultSchema.parse(
+        await window.api.migrateListWorkspaces({})
+      )
+    } catch (err) {
+      get().pushToast('error', `Failed to list workspaces: ${errorText(err)}`)
+      return []
+    }
+  },
+
+  runConvertClaudeAi: async (opts, owner = 'claudeai') => {
+    if (get().migrateJob !== null) {
+      return { ok: false, error: { kind: 'validation', message: 'Another migration step is already running' } }
+    }
+    set({ migrateJob: { kind: 'convert', owner }, convertProgress: [] })
+    try {
+      const result = ConvertResultSchema.parse(
+        await window.api.migrateConvertClaudeAi(opts)
+      )
+      return { ok: true, result }
+    } catch (err) {
+      return {
+        ok: false,
+        error: parseIpcError(err) ?? { kind: 'crash', message: errorText(err) }
+      }
+    } finally {
+      set({ migrateJob: null })
+    }
+  },
+
+  runImportAll: async (owner, opts) => {
+    if (get().migrateJob !== null) {
+      return { ok: false, error: { kind: 'validation', message: 'Another migration step is already running' } }
+    }
+    set({
+      migrateJob: { kind: 'importAll', owner },
+      importAllProgress: [],
+      importAllOwner: owner
+    })
+    try {
+      const result = ImportAllResultSchema.parse(
+        await window.api.migrateImportAll(opts)
+      )
+      if (!result.dryRun) void get().refreshTasks(true)
+      return { ok: true, result }
+    } catch (err) {
+      return {
+        ok: false,
+        error: parseIpcError(err) ?? { kind: 'crash', message: errorText(err) }
+      }
+    } finally {
+      set({ migrateJob: null })
+    }
+  },
+
+  cancelMigrate: async () => {
+    try {
+      await window.api.migrateCancel()
+    } catch (err) {
+      get().pushToast('error', `Cancel failed: ${errorText(err)}`)
+    }
+  },
+
+  findClaudeConsole: async () => {
+    try {
+      return ClaudeConsoleInfoSchema.parse(await window.api.claudeConsoleFind())
+    } catch {
+      return null
+    }
+  },
+
+  runConsolePull: async (chats) => {
+    if (get().consolePull?.running === true || get().claudeAiPull?.running === true) {
+      return { ok: false, error: { kind: 'validation', message: 'A pull is already running' } }
+    }
+    const runId = newPullRunId()
+    set({
+      consolePull: { runId, running: true, phase: 'typing', elapsedSec: 0, screenshot: null, fileBytes: null }
+    })
+    try {
+      const result = ClaudeConsolePullResultSchema.parse(
+        await window.api.claudeConsoleRunPull({ runId, chats })
+      )
+      return { ok: true, result }
+    } catch (err) {
+      return {
+        ok: false,
+        error: parseIpcError(err) ?? { kind: 'crash', message: errorText(err) }
+      }
+    } finally {
+      set((s) => (s.consolePull?.runId === runId ? { consolePull: { ...s.consolePull, running: false } } : {}))
+    }
+  },
+
+  cancelConsolePull: async () => {
+    try {
+      await window.api.claudeConsoleCancel()
+    } catch (err) {
+      get().pushToast('error', `Cancel failed: ${errorText(err)}`)
+    }
+  },
+
+  refreshClaudeAiSession: async () => {
+    set({ claudeAiSessionChecking: true })
+    try {
+      set({ claudeAiSession: ClaudeAiSessionStatusSchema.parse(await window.api.claudeAiStatus()) })
+    } catch (err) {
+      get().pushToast('error', `claude.ai sign-in check failed: ${errorText(err)}`)
+    } finally {
+      set({ claudeAiSessionChecking: false })
+    }
+  },
+
+  claudeAiSignIn: async () => {
+    try {
+      set({ claudeAiSession: ClaudeAiSessionStatusSchema.parse(await window.api.claudeAiSignIn()) })
+    } catch (err) {
+      get().pushToast('error', `Could not open the sign-in window: ${errorText(err)}`)
+    }
+  },
+
+  claudeAiSignOut: async () => {
+    try {
+      set({ claudeAiSession: ClaudeAiSessionStatusSchema.parse(await window.api.claudeAiSignOut()) })
+      get().pushToast('info', 'Signed out of claude.ai in ClaudeLift')
+    } catch (err) {
+      get().pushToast('error', `Sign out failed: ${errorText(err)}`)
+    }
+  },
+
+  runClaudeAiPull: async (chats) => {
+    if (get().claudeAiPull?.running === true || get().consolePull?.running === true) {
+      return { ok: false, error: { kind: 'validation', message: 'A pull is already running' } }
+    }
+    const runId = newPullRunId()
+    set({
+      claudeAiPull: { runId, running: true, phase: 'checking', elapsedSec: 0, fileBytes: null, lines: [] }
+    })
+    try {
+      const result = ClaudeAiPullResultSchema.parse(await window.api.claudeAiRunPull({ runId, chats }))
+      return { ok: true, result }
+    } catch (err) {
+      return {
+        ok: false,
+        error: parseIpcError(err) ?? { kind: 'crash', message: errorText(err) }
+      }
+    } finally {
+      set((s) => (s.claudeAiPull?.runId === runId ? { claudeAiPull: { ...s.claudeAiPull, running: false } } : {}))
+    }
+  },
+
+  cancelClaudeAiPull: async () => {
+    try {
+      await window.api.claudeAiCancel()
+    } catch (err) {
+      get().pushToast('error', `Cancel failed: ${errorText(err)}`)
     }
   },
 

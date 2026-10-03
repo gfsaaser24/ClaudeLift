@@ -15,9 +15,14 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { IpcRendererEvent } from 'electron'
 import type {
+  ClaudeAiPullProgress,
+  ClaudeAiSessionStatus,
+  ClaudeConsoleProgress,
+  ConvertProgressEvent,
   CoworkExporterApi,
   EventChannel,
   EventChannelMap,
+  ImportAllProgressEvent,
   InvokeChannel,
   InvokeChannelMap,
   NotionExportState,
@@ -48,14 +53,34 @@ const CH = {
   appDiagnostics: 'app:diagnostics',
   mcpInfo: 'mcp:info',
   mcpInstallToClaudeDesktop: 'mcp:installToClaudeDesktop',
-  mcpRevealServer: 'mcp:revealServer'
+  mcpRevealServer: 'mcp:revealServer',
+  migrateListWorkspaces: 'migrate:listWorkspaces',
+  migrateConvertClaudeAi: 'migrate:convertClaudeAi',
+  migrateImportAll: 'migrate:importAll',
+  migrateImportSpace: 'migrate:importSpace',
+  migrateCancel: 'migrate:cancel',
+  claudeConsoleFind: 'claudeConsole:find',
+  claudeConsoleScreenshot: 'claudeConsole:screenshot',
+  claudeConsoleRunPull: 'claudeConsole:runPull',
+  claudeConsoleCancel: 'claudeConsole:cancel',
+  claudeConsoleOpenOutput: 'claudeConsole:openOutput',
+  claudeAiStatus: 'claudeAi:status',
+  claudeAiSignIn: 'claudeAi:signIn',
+  claudeAiSignOut: 'claudeAi:signOut',
+  claudeAiRunPull: 'claudeAi:runPull',
+  claudeAiCancel: 'claudeAi:cancel'
 } as const satisfies InvokeChannelMap
 
 const EV = {
   tasksChanged: 'evt:tasksChanged',
   exportProgress: 'evt:exportProgress',
   notionProgress: 'evt:notionProgress',
-  watcherState: 'evt:watcherState'
+  watcherState: 'evt:watcherState',
+  convertProgress: 'evt:convertProgress',
+  importAllProgress: 'evt:importAllProgress',
+  claudeConsoleProgress: 'evt:claudeConsoleProgress',
+  claudeAiStatus: 'evt:claudeAiStatus',
+  claudeAiPullProgress: 'evt:claudeAiPullProgress'
 } as const satisfies EventChannelMap
 
 function invoke<T>(channel: InvokeChannel, ...args: unknown[]): Promise<T> {
@@ -114,6 +139,11 @@ const tasksChanged = eventBridge<[]>(EV.tasksChanged)
 const exportProgress = eventBridge<[ProgressEvent]>(EV.exportProgress)
 const notionProgress = eventBridge<[NotionExportState]>(EV.notionProgress)
 const watcherState = eventBridge<[WatcherState]>(EV.watcherState)
+const convertProgress = eventBridge<[ConvertProgressEvent]>(EV.convertProgress)
+const importAllProgress = eventBridge<[ImportAllProgressEvent]>(EV.importAllProgress)
+const claudeConsoleProgress = eventBridge<[ClaudeConsoleProgress]>(EV.claudeConsoleProgress)
+const claudeAiStatus = eventBridge<[ClaudeAiSessionStatus]>(EV.claudeAiStatus)
+const claudeAiPullProgress = eventBridge<[ClaudeAiPullProgress]>(EV.claudeAiPullProgress)
 
 const api: CoworkExporterApi = {
   tasksList: (req) => invoke(CH.tasksList, req),
@@ -138,6 +168,21 @@ const api: CoworkExporterApi = {
   mcpInfo: () => invoke(CH.mcpInfo),
   mcpInstallToClaudeDesktop: () => invoke(CH.mcpInstallToClaudeDesktop),
   mcpRevealServer: () => invoke(CH.mcpRevealServer),
+  migrateListWorkspaces: (req) => invoke(CH.migrateListWorkspaces, req),
+  migrateConvertClaudeAi: (opts) => invoke(CH.migrateConvertClaudeAi, opts),
+  migrateImportAll: (opts) => invoke(CH.migrateImportAll, opts),
+  migrateImportSpace: (opts) => invoke(CH.migrateImportSpace, opts),
+  migrateCancel: () => invoke(CH.migrateCancel),
+  claudeConsoleFind: () => invoke(CH.claudeConsoleFind),
+  claudeConsoleScreenshot: () => invoke(CH.claudeConsoleScreenshot),
+  claudeConsoleRunPull: (req) => invoke(CH.claudeConsoleRunPull, req),
+  claudeConsoleCancel: () => invoke(CH.claudeConsoleCancel),
+  claudeConsoleOpenOutput: (req) => invoke(CH.claudeConsoleOpenOutput, req),
+  claudeAiStatus: () => invoke(CH.claudeAiStatus),
+  claudeAiSignIn: () => invoke(CH.claudeAiSignIn),
+  claudeAiSignOut: () => invoke(CH.claudeAiSignOut),
+  claudeAiRunPull: (req) => invoke(CH.claudeAiRunPull, req),
+  claudeAiCancel: () => invoke(CH.claudeAiCancel),
 
   onTasksChanged: tasksChanged.on,
   offTasksChanged: tasksChanged.off,
@@ -146,7 +191,17 @@ const api: CoworkExporterApi = {
   onNotionProgress: notionProgress.on,
   offNotionProgress: notionProgress.off,
   onWatcherState: watcherState.on,
-  offWatcherState: watcherState.off
+  offWatcherState: watcherState.off,
+  onConvertProgress: convertProgress.on,
+  offConvertProgress: convertProgress.off,
+  onImportAllProgress: importAllProgress.on,
+  offImportAllProgress: importAllProgress.off,
+  onClaudeConsoleProgress: claudeConsoleProgress.on,
+  offClaudeConsoleProgress: claudeConsoleProgress.off,
+  onClaudeAiStatus: claudeAiStatus.on,
+  offClaudeAiStatus: claudeAiStatus.off,
+  onClaudeAiPullProgress: claudeAiPullProgress.on,
+  offClaudeAiPullProgress: claudeAiPullProgress.off
 }
 
 contextBridge.exposeInMainWorld('api', api)

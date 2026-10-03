@@ -23,6 +23,10 @@ extraResources:
   # Resolves the sidecar at ../engine/cowork-export/cowork-export.exe.
   - from: resources/mcp
     to: mcp
+  # Account-pull script typed into the Claude Desktop DevTools console —
+  # devtools-bridge.ts resolves process.resourcesPath/scripts/pull-claude-projects.js.
+  - from: ../scripts/pull-claude-projects.js
+    to: scripts/pull-claude-projects.js
 win:
   target: nsis
   icon: resources/icons/app.ico

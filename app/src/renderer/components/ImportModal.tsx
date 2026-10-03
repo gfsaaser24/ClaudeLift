@@ -7,15 +7,21 @@
  * - Remap editor: one row per manifest source_user_folders entry (src
  *   readonly) plus user-added rows (src editable); dst via typing or the
  *   folder picker. Rows are removable/addable.
+ * - Space: Auto (engine default — recreate the bundle's space by name on
+ *   the target account and file the task under it) or None.
  * - Toggles: keep-task-id; skip-auth (forced ON + disabled with an
  *   explanation when the bundle has auth from a non-win32 platform —
  *   the engine refuses cross-platform auth restore); force (hidden until
- *   an exit-3 "already exists" error is observed).
+ *   an exit-3 "already exists" error is observed); "import anyway while
+ *   Claude Desktop is running" (--allow-running, hidden until the engine's
+ *   exit-3 "Claude Desktop is running" refusal is observed).
  * - Dry-run shows engine stdout in a scrollable mockup-code block.
  * - Error mapping (JSON-in-Error.message convention): exit-2 shows stderr
  *   in an alert-error and, when the engine lists workspace candidates
  *   ("pick one with --workspace:"), renders a workspace select for retry;
- *   exit-3 reveals the force toggle.
+ *   exit-3 reveals the force toggle — or, when the engine refused because
+ *   Claude Desktop is running, a "quit it from the tray" warning plus the
+ *   allow-running checkbox.
  *
  * MEMORY RULE: the default export returns null when `bundle` is null.
  */
@@ -28,7 +34,7 @@ import {
   type ImportOptions,
   type ImportResult
 } from '../../shared/ipc'
-import { errorText, parseIpcError, useAppStore } from '../store'
+import { errorText, isDesktopRunningError, parseIpcError, useAppStore } from '../store'
 
 export interface ImportModalProps {
   /** Bundle to import, or null when the modal is closed. */
@@ -51,7 +57,11 @@ interface RemapRow {
 interface ShownError {
   message: string
   stderr: string
+  /** The engine refused because Claude Desktop is running (exit 3). */
+  desktopRunning: boolean
 }
+
+type SpaceMode = 'auto' | 'none'
 
 /**
  * Candidate paths from the engine's exit-2 ambiguity stderr: the indented
@@ -102,6 +112,9 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
   const [skipAuth, setSkipAuth] = useState(authLocked)
   const [force, setForce] = useState(false)
   const [showForce, setShowForce] = useState(false)
+  const [space, setSpace] = useState<SpaceMode>('auto')
+  const [allowRunning, setAllowRunning] = useState(false)
+  const [showAllowRunning, setShowAllowRunning] = useState(false)
   const [workspace, setWorkspace] = useState('')
   const [candidates, setCandidates] = useState<string[]>([])
   const [dryOutput, setDryOutput] = useState<string | null>(null)
@@ -146,7 +159,9 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
       skipAuth: authLocked ? true : skipAuth,
       force,
       dryRun,
-      ...(coworkRootOverride !== null ? { coworkRoot: coworkRootOverride } : {})
+      ...(coworkRootOverride !== null ? { coworkRoot: coworkRootOverride } : {}),
+      space,
+      allowRunning
     }
   }
 
@@ -164,7 +179,11 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
     } catch (err) {
       const info = parseIpcError(err)
       const stderr = info?.stderr ?? ''
-      if (info?.kind === 'aborted') {
+      const desktopRunning = isDesktopRunningError(info)
+      if (desktopRunning) {
+        // exit 3: Claude Desktop is running and would overwrite the import
+        setShowAllowRunning(true)
+      } else if (info?.kind === 'aborted') {
         // exit 3: target task dir already exists without --force
         setShowForce(true)
       }
@@ -172,7 +191,7 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
         const parsed = parseWorkspaceCandidates(stderr)
         if (parsed.length > 0) setCandidates(parsed)
       }
-      setError({ message: info?.message ?? errorText(err), stderr })
+      setError({ message: info?.message ?? errorText(err), stderr, desktopRunning })
     } finally {
       setRunning(null)
     }
@@ -315,7 +334,26 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
             </svg>
             Add remap
           </button>
-          <p className="label">Every source user folder needs a destination on this machine.</p>
+          <p className="label whitespace-normal">
+            Only needed for folders that do not exist on this machine — leave the destination
+            empty to keep the original path.
+          </p>
+        </fieldset>
+
+        {/* space */}
+        <fieldset className="fieldset">
+          <legend className="fieldset-legend">Space</legend>
+          <select
+            className="select w-full"
+            value={space}
+            onChange={(e) => setSpace(e.target.value === 'none' ? 'none' : 'auto')}
+          >
+            <option value="auto">Auto — recreate the bundle&apos;s space on this account</option>
+            <option value="none">None — import without a space</option>
+          </select>
+          <p className="label whitespace-normal">
+            Auto matches the space by name and creates it when missing, then files the task under it.
+          </p>
         </fieldset>
 
         {/* toggles */}
@@ -348,6 +386,19 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
               </span>
             </div>
           )}
+          {showAllowRunning && (
+            <label className="label cursor-pointer justify-start gap-3">
+              <input
+                type="checkbox"
+                className="checkbox checkbox-warning"
+                checked={allowRunning}
+                onChange={(e) => setAllowRunning(e.target.checked)}
+              />
+              <span className="text-base-content">
+                Import anyway while Claude Desktop is running
+              </span>
+            </label>
+          )}
           {showForce && (
             <label className="label cursor-pointer justify-start gap-3">
               <input
@@ -374,8 +425,21 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
           </div>
         )}
 
+        {/* error: Claude Desktop is running */}
+        {error !== null && error.desktopRunning && (
+          <div role="alert" className="alert alert-warning alert-vertical mt-3 items-start text-left">
+            <span className="font-semibold">Claude Desktop is running</span>
+            <span className="whitespace-normal">
+              Quit it first: right-click the Claude icon in the system tray and choose Quit (closing
+              the window is not enough). It keeps spaces and task lists in memory and would overwrite
+              the import. Then press Import again — or tick &quot;Import anyway while Claude Desktop
+              is running&quot; above.
+            </span>
+          </div>
+        )}
+
         {/* error */}
-        {error !== null && (
+        {error !== null && !error.desktopRunning && (
           <div role="alert" className="alert alert-error alert-vertical mt-3 items-start text-left">
             <span className="whitespace-normal break-words font-semibold">{error.message}</span>
             {error.stderr.trim() !== '' && (
@@ -393,7 +457,7 @@ function ImportModalBody({ bundle, onClose }: { bundle: BundleInfo; onClose: () 
               Import complete
               {done.newTaskId !== null ? ` — new task id ${done.newTaskId}` : ''}
             </span>
-            <span>Restart Cowork desktop to see the imported task.</span>
+            <span>Start Claude Desktop again to see the imported task.</span>
           </div>
         )}
 

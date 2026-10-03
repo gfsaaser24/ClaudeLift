@@ -15,6 +15,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
 import {
+  CLAUDEAI_PARTS,
+  convertClaudeAi,
   exportTask,
   getTranscript,
   importBundle,
@@ -162,7 +164,7 @@ const FORMAT_VALUES = ['markdown', 'json'] as const
 const EXPORT_FORMAT_VALUES = ['html', 'md', 'json', 'csv'] as const
 
 function buildServer(): McpServer {
-  const server = new McpServer({ name: 'claudelift-mcp-server', version: '0.5.0' })
+  const server = new McpServer({ name: 'claudelift-mcp-server', version: '0.6.0' })
 
   server.registerTool(
     'claudelift_list_tasks',
@@ -399,6 +401,57 @@ function buildServer(): McpServer {
     }
   )
 
+  server.registerTool(
+    'claudelift_convert_claudeai',
+    {
+      title: 'Convert a claude.ai data export into bundles',
+      description:
+        'Convert a claude.ai "Export data" download (the folder with conversations-*.zip, ' +
+        'projects-*.zip, memories-*.zip, or the extracted files, or a single zip) into ClaudeLift ' +
+        'bundles: one importable bundle per chat under conversations/, one space bundle per project ' +
+        'under projects/, and account memory under memory/. Writes ONLY into output_dir (defaults to ' +
+        'Documents/CoworkExports/claudeai) — Cowork and the export itself are never modified. ' +
+        'Import the result with the ClaudeLift desktop app (Migrate view).',
+      inputSchema: {
+        export_path: z.string().describe('claude.ai export folder (zips or extracted) or a single zip.'),
+        output_dir: z
+          .string()
+          .optional()
+          .describe('Where bundles are written (defaults to Documents/CoworkExports/claudeai).'),
+        what: z
+          .array(z.enum(CLAUDEAI_PARTS))
+          .optional()
+          .describe(
+            'Parts to convert (default: conversations, projects, memory, design — everything except ' +
+              'the large artifacts archive).'
+          ),
+        since: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}/, 'ISO date, e.g. 2026-06-01')
+          .optional()
+          .describe('Only chats updated on/after this ISO date (e.g. 2026-06-01).'),
+        match: z.string().optional().describe('Only chats whose title contains this text.'),
+        limit: z.number().int().positive().optional().describe('At most N chats (newest first).')
+      },
+      // Writes new files into output_dir only; re-running rewrites the same bundles.
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+    },
+    async ({ export_path, output_dir, what, since, match, limit }) => {
+      const source = export_path.trim()
+      if (source.length === 0) return fail('export_path is required.')
+      const dir = output_dir && output_dir.length > 0 ? output_dir : join(defaultOutputDir(), 'claudeai')
+      try {
+        const summary = await convertClaudeAi({ exportPath: source, outputDir: dir, what, since, match, limit })
+        return ok(
+          `Converted the claude.ai export into:\n${summary.output}\n\n${JSON.stringify(summary, null, 2)}\n\n` +
+            'Import it with the ClaudeLift desktop app (Migrate → Import a claude.ai data export, step 2).'
+        )
+      } catch (err) {
+        return fail(`could not convert "${source}": ${errText(err)}`)
+      }
+    }
+  )
+
   return server
 }
 
@@ -407,7 +460,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport()
   await server.connect(transport)
   // stderr only — stdout is the JSON-RPC channel.
-  console.error('claudelift-mcp-server 0.5.0 ready on stdio (6 tools registered)')
+  console.error('claudelift-mcp-server 0.6.0 ready on stdio (7 tools registered)')
 }
 
 main().catch((err) => {

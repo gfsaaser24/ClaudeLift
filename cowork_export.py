@@ -3,7 +3,8 @@
 
 Cowork stores each chat as a "task" under the Claude desktop app's user-data dir:
     macOS:   ~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<ws>/
-    Windows: %APPDATA%\\Claude\\local-agent-mode-sessions\\<acct>\\<ws>\\
+    Windows: %LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\local-agent-mode-sessions\\<acct>\\<ws>\\
+             (MSIX build; the app itself sees this as %APPDATA%\\Claude\\...)
     Linux:   ~/.config/Claude/local-agent-mode-sessions/<acct>/<ws>/
 
 Each task lays out:
@@ -13,7 +14,9 @@ Each task lays out:
         uploads/                                 # user-attached files
         outputs/                                 # files the assistant generated
         audit.jsonl                              # audit log
+agent/local_ditto_<org>.json + agent/local_ditto_<org>/   # Dispatch agent session
 spaces.json                                      # space (project) registry
+spaces/<space-id>/memory/*.md                    # space memory (synced to the space's claude.ai project)
 
 This tool (Windows branch) flattens that into HTML / MD / JSON / CSV plus a
 snapshot of uploads, outputs, and any other files the assistant wrote. Falls
@@ -35,6 +38,7 @@ import errno
 import html as html_mod
 import json
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -116,7 +120,7 @@ DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
 BUNDLE_VERSION = 1
-TOOL_VERSION = "0.5.0-desktop"
+TOOL_VERSION = "0.6.0-desktop"
 SEED_TEXT_TRUNCATE = 500
 SEED_TOOL_INPUT_TRUNCATE = 200
 SEED_TOOL_RESULT_TRUNCATE = 400
@@ -202,14 +206,7 @@ def _load_spaces(workspace_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
     """Return (folder_path -> space_name, project_uuid -> space_name)."""
     by_folder: dict[str, str] = {}
     by_project: dict[str, str] = {}
-    sf = workspace_dir / "spaces.json"
-    if not sf.exists():
-        return by_folder, by_project
-    try:
-        data = json.loads(sf.read_text(encoding="utf-8"))
-    except Exception:
-        return by_folder, by_project
-    for s in data.get("spaces", []):
+    for s in _read_spaces(workspace_dir):
         name = s.get("name", "")
         for fld in s.get("folders", []) or []:
             p = fld.get("path")
@@ -219,7 +216,39 @@ def _load_spaces(workspace_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
             u = prj.get("uuid")
             if u:
                 by_project[u] = name
+        mig = s.get("migration") or {}
+        if mig.get("projectUuid"):
+            by_project[mig["projectUuid"]] = name
     return by_folder, by_project
+
+
+def _read_spaces(workspace_dir: Path) -> list[dict[str, Any]]:
+    """Raw space records from ``<workspace>/spaces.json`` (empty on any error)."""
+    sf = workspace_dir / "spaces.json"
+    if not sf.exists():
+        return []
+    try:
+        data = json.loads(sf.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    spaces = data.get("spaces") if isinstance(data, dict) else None
+    return [s for s in spaces or [] if isinstance(s, dict) and s.get("id")]
+
+
+def _space_for_task(workspace_dir: Path, space_id: str, user_folders: list[str]) -> dict[str, Any] | None:
+    """The space a task belongs to. Newer desktop builds record ``spaceId`` on
+    the task; several spaces can share a folder, so the folder match is only a
+    fallback for older tasks that predate ``spaceId``."""
+    spaces = _read_spaces(workspace_dir)
+    if space_id:
+        for s in spaces:
+            if s.get("id") == space_id:
+                return s
+    for f in user_folders:
+        for s in spaces:
+            if any(fld.get("path") == f for fld in s.get("folders", []) or [] if isinstance(fld, dict)):
+                return s
+    return None
 
 
 def _resolve_transcript(task_dir: Path, cli_session_id: str) -> Path | None:
@@ -252,6 +281,17 @@ def _resolve_transcript(task_dir: Path, cli_session_id: str) -> Path | None:
     return None
 
 
+def _task_meta_files(workspace: Path) -> list[tuple[Path, Path]]:
+    """(meta_file, parent_dir) for every task in a workspace: regular Cowork
+    tasks at the top level plus the Dispatch agent session(s) the desktop app
+    keeps under ``agent/local_ditto_<org>.json``."""
+    out = [(m, workspace) for m in sorted(workspace.glob("local_*.json"))]
+    agent_dir = workspace / "agent"
+    if agent_dir.is_dir():
+        out.extend((m, agent_dir) for m in sorted(agent_dir.glob("local_*.json")))
+    return out
+
+
 def _enumerate_root_tasks(root: Path) -> list[Task]:
     out: list[Task] = []
     if not root.exists():
@@ -262,28 +302,28 @@ def _enumerate_root_tasks(root: Path) -> list[Task]:
         for workspace in sorted(acct.iterdir()):
             if not workspace.is_dir():
                 continue
-            spaces_by_folder, _ = _load_spaces(workspace)
-            for meta_file in sorted(workspace.glob("local_*.json")):
+            for meta_file, parent in _task_meta_files(workspace):
                 try:
                     meta = json.loads(meta_file.read_text(encoding="utf-8"))
                 except Exception:
                     continue
+                if not isinstance(meta, dict):
+                    continue
                 task_id = meta.get("sessionId") or meta_file.stem
                 if task_id.startswith("local_"):
                     task_id = task_id[len("local_"):]
-                task_dir = workspace / f"local_{task_id}"
+                task_dir = parent / f"local_{task_id}"
                 cli_id = meta.get("cliSessionId") or ""
                 transcript = _resolve_transcript(task_dir, cli_id) if task_dir.exists() else None
-                user_folders = meta.get("userSelectedFolders") or []
-                space_name = ""
-                for f in user_folders:
-                    if f in spaces_by_folder:
-                        space_name = spaces_by_folder[f]
-                        break
+                user_folders = [f for f in meta.get("userSelectedFolders") or [] if isinstance(f, str)]
+                space = _space_for_task(workspace, meta.get("spaceId") or "", user_folders)
+                title = meta.get("title", "") or ""
+                if not title and meta.get("sessionType") == "agent":
+                    title = "Dispatch agent"
                 out.append(Task(
                     source="cowork",
                     task_id=task_id,
-                    title=meta.get("title", "") or "",
+                    title=title,
                     model=meta.get("model", "") or "",
                     workspace_dir=workspace,
                     task_meta_file=meta_file,
@@ -297,7 +337,8 @@ def _enumerate_root_tasks(root: Path) -> list[Task]:
                     last_activity_ms=int(meta.get("lastActivityAt") or 0),
                     archived=bool(meta.get("isArchived")),
                     error=meta.get("error", "") or "",
-                    space_name=space_name,
+                    space_name=(space or {}).get("name", "") or "",
+                    space_id=(space or {}).get("id", "") or "",
                 ))
     return out
 
@@ -1460,10 +1501,55 @@ def _cowork_userdata_root() -> Path:
     if sys.platform == "darwin":
         return HOME / "Library" / "Application Support" / "Claude"
     if sys.platform == "win32":
+        # MSIX/Store builds keep the real files under the package's
+        # LocalCache; %APPDATA%\Claude only exists inside the app's
+        # virtualised view (and on older non-MSIX installs).
+        for root in _cowork_roots():
+            if "LocalCache" in root.parts:
+                return root.parent
         appdata = os.environ.get("APPDATA")
         base = Path(appdata) if appdata else (HOME / "AppData" / "Roaming")
         return base / "Claude"
     return HOME / ".config" / "Claude"
+
+
+def _app_visible_path(p: str) -> str:
+    """Translate a real on-disk path under an MSIX package's
+    ``LocalCache\\Roaming`` into the ``%APPDATA%`` form the desktop app (and
+    the Claude Code process it spawns) sees through MSIX file virtualisation.
+    Task metadata, transcripts and the ``.claude/projects/<encoded-cwd>``
+    folder name all use that virtualised form."""
+    if sys.platform != "win32" or not p:
+        return p
+    m = re.match(r"^(.*?\\Packages\\Claude_[^\\]+\\LocalCache\\Roaming)(\\.*)?$", p, re.IGNORECASE)
+    if not m:
+        return p
+    appdata = os.environ.get("APPDATA") or str(HOME / "AppData" / "Roaming")
+    return appdata + (m.group(2) or "")
+
+
+def _real_path_forms(p: str) -> list[str]:
+    """Every spelling of a sandbox path that may appear in exported data:
+    the path as given plus its MSIX virtualised / LocalCache twin."""
+    forms = [p] if p else []
+    vis = _app_visible_path(p)
+    if vis and vis not in forms:
+        forms.append(vis)
+    if sys.platform == "win32" and p:
+        appdata = os.environ.get("APPDATA") or str(HOME / "AppData" / "Roaming")
+        if p.lower().startswith(appdata.lower() + "\\claude"):
+            for root in _cowork_roots():
+                if "LocalCache" in root.parts:
+                    twin = str(root.parent.parent) + p[len(appdata):]
+                    if twin not in forms:
+                        forms.append(twin)
+    return forms
+
+
+def encode_project_dir(cwd: str) -> str:
+    """Claude Code's ``~/.claude/projects/<name>`` folder name for a cwd:
+    every non-alphanumeric character becomes ``-``."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
 def _confirm_auth_risk(non_interactive_ack: bool) -> None:
@@ -1684,12 +1770,37 @@ def _write_manifest(
         "source_cwd": meta.cwd or "",
         "source_user_folders": list(meta.user_folders or []),
         "source_account_hint": "",
+        "source_space_id": task.space_id,
+        "source_space_name": task.space_name,
         "auth": auth_info or {"included": False},
     }
     (target / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _export_space(task: Task, target: Path) -> None:
+    """Write the task's space (Cowork "project") into the bundle: the
+    spaces.json record as ``space/space.json`` and the space's memory notes
+    under ``space/memory/``, so an import on another account can rebuild it."""
+    if not task.space_id or not task.workspace_dir:
+        return
+    space = _space_for_task(task.workspace_dir, task.space_id, [])
+    if not space:
+        return
+    out = target / "space"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "space.json").write_text(json.dumps(space, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    mem_src = task.workspace_dir / "spaces" / task.space_id / "memory"
+    if mem_src.is_dir():
+        for f in list_dir_files(mem_src):
+            dest = out / "memory" / f.relative_to(mem_src)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(f, dest)
+            except OSError as e:
+                print(f"  warn: failed to copy space memory {f}: {e}", file=sys.stderr)
 
 
 def export_one(
@@ -1714,6 +1825,7 @@ def export_one(
     shutil.copy2(task.transcript_path, target / "transcript.jsonl")
     if task.task_meta_file and task.task_meta_file.exists():
         shutil.copy2(task.task_meta_file, target / "task.json")
+    _export_space(task, target)
     audit_src = (task.task_dir / "audit.jsonl") if task.task_dir else None
     if audit_src and audit_src.exists():
         try:
@@ -1889,6 +2001,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "title": t.title,
                 "model": t.model,
                 "space_name": t.space_name,
+                "space_id": t.space_id,
                 "cwd": t.cwd,
                 "created_at_ms": t.created_at_ms,
                 "last_activity_ms": t.last_activity_ms,
@@ -2084,7 +2197,8 @@ def _apply_remaps(
     dst_sep: str,
     src_platform: str,
 ) -> str:
-    for src, dst in remaps:
+    # Most specific prefix wins (a task dir before the sandbox root above it).
+    for src, dst in sorted(remaps, key=lambda r: len(r[0] or ""), reverse=True):
         rewritten = _rewrite_path_prefix(path, src, dst, src_sep, dst_sep, src_platform)
         if rewritten != path:
             return rewritten
@@ -2099,6 +2213,9 @@ def _rewrite_jsonl(
     src_sep: str,
     dst_sep: str,
     src_platform: str,
+    *,
+    fill_cwd: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, int]:
     counts = {"cwd": 0, "file_path": 0, "notebook_path": 0, "records": 0}
     src_cwd, dst_cwd = cwd_remap
@@ -2117,9 +2234,13 @@ def _rewrite_jsonl(
             counts["records"] += 1
             if isinstance(obj.get("cwd"), str):
                 new = _apply_remaps(obj["cwd"], all_remaps, src_sep, dst_sep, src_platform)
+                if not new and fill_cwd:
+                    new = fill_cwd
                 if new != obj["cwd"]:
                     counts["cwd"] += 1
                     obj["cwd"] = new
+            if session_id and isinstance(obj.get("sessionId"), str):
+                obj["sessionId"] = session_id
             msg = obj.get("message")
             if isinstance(msg, dict):
                 content = msg.get("content")
@@ -2137,8 +2258,29 @@ def _rewrite_jsonl(
                                 if new != v:
                                     counts[key] += 1
                                     inp[key] = new
+            for key in ("toolUseResult", "attachment"):
+                if isinstance(obj.get(key), (dict, list)):
+                    _remap_path_fields(obj[key], all_remaps, src_sep, dst_sep, src_platform)
             fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     return counts
+
+
+_PATH_FIELD_NAMES = {"filePath", "file_path", "notebook_path", "path", "filename"}
+
+
+def _remap_path_fields(node: Any, remaps: list[tuple[str, str]], src_sep: str, dst_sep: str, src_platform: str) -> None:
+    """Rewrite path-valued fields (``filePath``, ``path``, ...) anywhere inside
+    a tool result / attachment payload."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str) and k in _PATH_FIELD_NAMES:
+                node[k] = _apply_remaps(v, remaps, src_sep, dst_sep, src_platform)
+            elif isinstance(v, (dict, list)):
+                _remap_path_fields(v, remaps, src_sep, dst_sep, src_platform)
+    elif isinstance(node, list):
+        for v in node:
+            if isinstance(v, (dict, list)):
+                _remap_path_fields(v, remaps, src_sep, dst_sep, src_platform)
 
 
 def _rewrite_task_json(
@@ -2152,11 +2294,25 @@ def _rewrite_task_json(
     src_sep: str,
     dst_sep: str,
     src_platform: str,
+    *,
+    new_cwd: str | None = None,
+    identity: dict[str, str] | None = None,
+    space_id: str = "",
 ) -> dict[str, Any]:
     data = json.loads(src_task_json.read_text(encoding="utf-8"))
     all_remaps = [cwd_remap, sandbox_remap] + extra_remaps
     if isinstance(data.get("cwd"), str):
         data["cwd"] = _apply_remaps(data["cwd"], all_remaps, src_sep, dst_sep, src_platform)
+    if new_cwd:
+        data["cwd"] = new_cwd
+    for key in ACCOUNT_BOUND_TASK_FIELDS:
+        data.pop(key, None)
+    data.update(identity or {})
+    data.pop("spaceId", None)
+    data.pop("spaceIdSetBy", None)
+    if space_id:
+        data["spaceId"] = space_id
+        data["spaceIdSetBy"] = "user"
     if isinstance(data.get("userSelectedFolders"), list):
         data["userSelectedFolders"] = [
             _apply_remaps(p, extra_remaps, src_sep, dst_sep, src_platform) if isinstance(p, str) else p
@@ -2174,6 +2330,203 @@ def _rewrite_task_json(
     data["vmProcessName"] = data["processName"]
     dst_task_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return data
+
+
+# ---------------------------------------------------------------------------
+# Spaces (Cowork "projects") on the import side
+# ---------------------------------------------------------------------------
+
+# Task metadata fields that belong to the account / install the task was
+# recorded on. The desktop app rebuilds them for the signed-in account when a
+# task is resumed; carrying them over would point the task at the old
+# account's connectors, plugins and system prompt.
+ACCOUNT_BOUND_TASK_FIELDS = (
+    "accountName",
+    "emailAddress",
+    "enabledMcpTools",
+    "remoteMcpServersConfig",
+    "pluginInstallPaths",
+    "systemPrompt",
+    "systemPromptRendererAppends",
+    "coworkSyspromptMap",
+    "memoryGuidelinesTemplate",
+    "orgCliExecPolicies",
+    "slashCommands",
+    "fsDetectedFiles",
+)
+
+
+ACCOUNT_MEMORY_SPACE = "Account memory (imported)"
+# Claude Desktop's space → project memory copy skips files above this size and
+# stops after this many files per project.
+SPACE_MEMORY_MAX_FILE_BYTES = 48_896
+SPACE_MEMORY_MAX_FILES = 200
+
+
+def _workspace_identity(workspace: Path) -> dict[str, str]:
+    """accountName / emailAddress as recorded on an existing task of the
+    target workspace, so imported tasks look like they belong to it."""
+    for meta_file, _ in _task_meta_files(workspace):
+        try:
+            d = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(d, dict) and d.get("emailAddress"):
+            return {k: d[k] for k in ("accountName", "emailAddress") if d.get(k)}
+    return {}
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    tmp = path.with_name(path.name + ".claudelift-tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _copy_tree_no_clobber(src: Path, dst: Path) -> tuple[int, int]:
+    """Copy files under src into dst. Existing identical files are skipped;
+    an existing *different* file keeps its content and the incoming one is
+    written next to it as ``<stem>.imported<suffix>``. Returns (copied, skipped)."""
+    copied = skipped = 0
+    if not src.is_dir():
+        return 0, 0
+    for f in list_dir_files(src):
+        dest = dst / f.relative_to(src)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            try:
+                if dest.read_bytes() == f.read_bytes():
+                    skipped += 1
+                    continue
+            except OSError:
+                pass
+            dest = dest.with_name(f"{dest.stem}.imported{dest.suffix}")
+        shutil.copy2(f, dest)
+        copied += 1
+    return copied, skipped
+
+
+def upsert_space(
+    workspace: Path,
+    space: dict[str, Any],
+    memory_src: Path | None,
+    docs_src: Path | None,
+    docs_root: Path | None,
+    *,
+    dry_run: bool = False,
+) -> tuple[str, bool, list[str]]:
+    """Make sure the target workspace has a space matching ``space`` (by name,
+    case-insensitive) and return (space_id, created, log_lines).
+
+    A new space is written without a ``migration`` record: the desktop app
+    treats it like any space created in the UI and links it to a claude.ai
+    project for the signed-in account. Its memory notes go to
+    ``spaces/<id>/memory/``; project knowledge docs (claude.ai exports) are
+    written to ``<docs_root>/<space name>/`` and attached as a space folder.
+    ``spaces.json`` is backed up before the first change."""
+    log: list[str] = []
+    name = (space.get("name") or "").strip() or "Imported space"
+    sf = workspace / "spaces.json"
+    try:
+        data = json.loads(sf.read_text(encoding="utf-8")) if sf.exists() else {"spaces": []}
+    except Exception as e:
+        raise SystemExit(f"error: cannot parse {sf}: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("spaces"), list):
+        data = {"spaces": []}
+    existing = next(
+        (s for s in data["spaces"] if isinstance(s, dict) and (s.get("name") or "").strip().lower() == name.lower()),
+        None,
+    )
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    created = existing is None
+    if existing is None:
+        import uuid as _uuid
+        rec: dict[str, Any] = {
+            "id": str(_uuid.uuid4()),
+            "name": name,
+            "folders": [],
+            "projects": [],
+            "links": [],
+            "instructions": space.get("instructions") or "",
+            "origin": space.get("origin") if space.get("origin") in ("user", "auto", "import") else "user",
+            "createdAt": int(space.get("createdAt") or now_ms),
+            "updatedAt": now_ms,
+        }
+        for fld in space.get("folders") or []:
+            if isinstance(fld, dict) and fld.get("path") and Path(fld["path"]).exists():
+                rec["folders"].append({"path": fld["path"]})
+        log.append(f"space: create {name!r} ({rec['id']})")
+    else:
+        rec = existing
+        log.append(f"space: reuse {name!r} ({rec['id']})")
+        if not rec.get("instructions") and space.get("instructions"):
+            rec["instructions"] = space["instructions"]
+            rec["updatedAt"] = now_ms
+            log.append("space: filled empty instructions")
+
+    # Uploaded project files (PDFs, images) sit next to docs/ in a project
+    # bundle and land in a files/ subfolder of the same space folder.
+    files_src = docs_src.parent / "files" if docs_src else None
+    has_docs = bool(docs_src and docs_src.is_dir() and any(docs_src.iterdir()))
+    has_files = bool(files_src and files_src.is_dir() and any(files_src.iterdir()))
+    if has_docs or has_files:
+        root = docs_root or (HOME / "Claude" / "Projects")
+        folder = root / (re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(". ") or rec["id"])
+        log.append(f"space: knowledge docs → {folder}")
+        if not dry_run:
+            c, k = _copy_tree_no_clobber(docs_src, folder) if has_docs else (0, 0)
+            fc, fk = _copy_tree_no_clobber(files_src, folder / "files") if has_files else (0, 0)
+            log.append(f"space: docs copied={c} unchanged={k}; files copied={fc} unchanged={fk}")
+        if not any(isinstance(f, dict) and f.get("path") == str(folder) for f in rec.get("folders") or []):
+            rec.setdefault("folders", []).append({"path": str(folder)})
+            rec["updatedAt"] = now_ms
+
+    if memory_src and memory_src.is_dir():
+        mem_dst = workspace / "spaces" / rec["id"] / "memory"
+        mem_files = list_dir_files(memory_src)
+        n = len(mem_files)
+        log.append(f"space: {n} memory file(s) → {mem_dst}")
+        big = [f.name for f in mem_files if f.stat().st_size > SPACE_MEMORY_MAX_FILE_BYTES]
+        if big:
+            log.append(f"space: warn: {len(big)} memory file(s) over {SPACE_MEMORY_MAX_FILE_BYTES} bytes "
+                       f"will not sync to the cloud project: {', '.join(big[:5])}")
+        if n > SPACE_MEMORY_MAX_FILES:
+            log.append(f"space: warn: only the first {SPACE_MEMORY_MAX_FILES} memory files sync to the cloud project")
+        if not dry_run:
+            c, k = _copy_tree_no_clobber(memory_src, mem_dst)
+            log.append(f"space: memory copied={c} unchanged={k}")
+
+    if not dry_run:
+        if created:
+            data["spaces"].append(rec)
+        if sf.exists():
+            backup = sf.with_name(f"spaces.json.bak-claudelift")
+            if not backup.exists():
+                shutil.copy2(sf, backup)
+        _write_json_atomic(sf, data)
+    return rec["id"], created, log
+
+
+def _desktop_running() -> bool:
+    """True when Claude Desktop is running (it rewrites spaces.json and task
+    metadata from memory, which would undo an import made underneath it)."""
+    if sys.platform != "win32":
+        return False
+    # Claude Code's CLI is also claude.exe, so match on the install location
+    # (MSIX lives under WindowsApps, the Squirrel build under AnthropicClaude).
+    script = (
+        "Get-Process -Name claude -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.Path -like '*\\WindowsApps\\*' -or $_.Path -like '*\\AnthropicClaude\\*' } | "
+        "Select-Object -First 1 -ExpandProperty Id"
+    )
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except Exception:
+        return False
+    return bool(out.strip())
 
 
 def _workspace_leaves(root: Path) -> list[Path]:
@@ -2291,9 +2644,12 @@ def cmd_import(args: argparse.Namespace) -> int:
         s, d = r.split("=", 1)
         remaps.append((s, d))
 
-    # Require remaps for every userSelectedFolder
+    # Require remaps for every userSelectedFolder that does not exist here
+    # (same-machine moves between accounts keep their folders as they are).
     for f in src_user_folders:
         if not any(_starts_with_path(f, s, src_platform) for s, _ in remaps):
+            if src_platform == dst_platform and Path(f).exists():
+                continue
             print(
                 f"error: source userSelectedFolders entry has no --remap mapping:\n"
                 f"       {f}\n"
@@ -2320,7 +2676,11 @@ def cmd_import(args: argparse.Namespace) -> int:
     new_cli_session_id = str(_uuid.uuid4())
     new_task_dir = target_workspace / f"local_{new_task_id}"
     new_task_meta = target_workspace / f"local_{new_task_id}.json"
-    new_cwd = str(new_task_dir / "outputs")
+    # Files are written to the real location; every path *recorded* in the
+    # task (cwd, transcript records, project-dir name) uses the form the
+    # desktop app sees, which on MSIX builds is the virtualised %APPDATA% path.
+    new_task_dir_vis = _app_visible_path(str(new_task_dir))
+    new_cwd = _app_visible_path(str(new_task_dir / "outputs"))
 
     if dst_platform == "win32":
         msg = _validate_path_for_windows(new_cwd)
@@ -2328,14 +2688,47 @@ def cmd_import(args: argparse.Namespace) -> int:
             print(f"error: target cwd {new_cwd!r} {msg}", file=sys.stderr)
             return 2
 
-    dst_sandbox = str(target_root)
+    dst_sandbox = _app_visible_path(str(target_root))
     cwd_remap = (src_cwd, new_cwd)
     sandbox_remap = (src_sandbox, dst_sandbox)
+    # Source paths show up in both MSIX spellings; map the task dir (covers
+    # uploads/, outputs/, host-cwd/) and the sandbox root in each spelling.
+    # The recorded cwd is whatever the session last ran in (outputs/,
+    # host-cwd/, ...); the task dir is the `local_<task-id>` segment above it.
+    src_task_dir = ""
+    if src_cwd and src_task_id:
+        norm = src_cwd.replace("/", src_sep)
+        marker = f"{src_sep}local_{src_task_id}"
+        idx = norm.lower().find(marker.lower())
+        if idx >= 0:
+            src_task_dir = norm[: idx + len(marker)]
+    if src_task_dir:
+        cwd_remap = (src_task_dir + src_sep + "outputs", new_cwd)
+    sandbox_remaps: list[tuple[str, str]] = []
+    for form in _real_path_forms(src_task_dir) if src_platform == dst_platform else ([src_task_dir] if src_task_dir else []):
+        sandbox_remaps.append((form, new_task_dir_vis))
+    for form in _real_path_forms(src_sandbox) if src_platform == dst_platform else ([src_sandbox] if src_sandbox else []):
+        sandbox_remaps.append((form, dst_sandbox))
+
+    # Space ("project") the task belongs to: rebuilt on the target account
+    # from the bundle's space/ folder unless --space says otherwise.
+    space_choice = getattr(args, "space", None) or "auto"
+    bundle_space = bundle / "space" / "space.json"
+    space_rec: dict[str, Any] | None = None
+    if space_choice == "auto" and bundle_space.exists():
+        try:
+            space_rec = json.loads(bundle_space.read_text(encoding="utf-8"))
+        except Exception:
+            space_rec = None
+    identity = getattr(args, "identity", None)
+    if identity is None:
+        identity = _workspace_identity(target_workspace)
 
     # Plan output
     print(f"Source bundle: {bundle}")
     print(f"  tool_version:       {manifest.get('tool_version')}")
     print(f"  exported_at:        {manifest.get('exported_at')}")
+    print(f"  source_kind:        {manifest.get('source_kind') or 'cowork'}")
     print(f"  source_platform:    {src_platform}")
     print(f"  source_task_id:     {src_task_id}")
     print(f"  source_cwd:         {src_cwd}")
@@ -2343,6 +2736,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     print()
     print(f"Target ({dst_platform}):")
     print(f"  workspace:          {target_workspace}")
+    print(f"  account:            {identity.get('emailAddress') or '(no existing task to read it from)'}")
     print(f"  new_task_id:        {new_task_id}")
     print(f"  new_cli_session_id: {new_cli_session_id}")
     print(f"  new_task_dir:       {new_task_dir}")
@@ -2352,6 +2746,10 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"  user folder remaps: {len(remaps)}")
         for s, d in remaps:
             print(f"    {s} → {d}")
+    if space_rec:
+        print(f"  space:              {space_rec.get('name')!r} (matched by name, created if missing)")
+    elif space_choice not in ("auto", "none"):
+        print(f"  space:              {space_choice}")
     if has_auth:
         if install_auth:
             print(f"  auth: {sum(1 for _ in bundle_auth.iterdir())} artefact(s) → "
@@ -2360,9 +2758,24 @@ def cmd_import(args: argparse.Namespace) -> int:
             print(f"  auth: skipped ({'--skip-auth' if args.skip_auth else 'cross-platform refusal'})")
 
     if args.dry_run:
+        if space_rec:
+            _, _, log = upsert_space(
+                target_workspace, space_rec, bundle / "space" / "memory", None, None, dry_run=True,
+            )
+            for line in log:
+                print(f"  {line}")
         print()
         print("Dry-run: no files written.")
         return 0
+
+    if not getattr(args, "allow_running", False) and _desktop_running():
+        print(
+            "error: Claude Desktop is running. Quit it first (tray icon → Quit):\n"
+            "       it keeps spaces and task lists in memory and would overwrite the import.\n"
+            "       Pass --allow-running to import anyway.",
+            file=sys.stderr,
+        )
+        return 3
 
     if new_task_dir.exists() and not args.force:
         print(f"error: {new_task_dir} already exists. Use --force to overwrite.",
@@ -2374,25 +2787,46 @@ def cmd_import(args: argparse.Namespace) -> int:
     (new_task_dir / "uploads").mkdir(exist_ok=True)
 
     print()
+    target_space_id = ""
+    if space_rec:
+        target_space_id, _, log = upsert_space(
+            target_workspace, space_rec, bundle / "space" / "memory", None, None,
+        )
+        for line in log:
+            print(line)
+    elif space_choice not in ("auto", "none"):
+        target_space_id = space_choice
+
+    path_remaps = sandbox_remaps + remaps
     # Rewrite task.json
-    if manifest.get("source_task_id"):
-        src_task_meta = bundle / "task.json"
-        if src_task_meta.exists():
-            _rewrite_task_json(
-                src_task_meta, new_task_meta, cwd_remap, sandbox_remap,
-                new_task_id, new_cli_session_id, remaps, src_sep, dst_sep, src_platform,
-            )
-            print(f"wrote {new_task_meta}")
+    src_task_meta = bundle / "task.json"
+    if src_task_meta.exists():
+        _rewrite_task_json(
+            src_task_meta, new_task_meta, cwd_remap, sandbox_remap,
+            new_task_id, new_cli_session_id, path_remaps, src_sep, dst_sep, src_platform,
+            new_cwd=new_cwd, identity=identity, space_id=target_space_id,
+        )
+        print(f"wrote {new_task_meta}")
 
     # Rewrite transcript.jsonl into the task's .claude/projects/<encoded>/
     src_transcript = bundle / "transcript.jsonl"
     if src_transcript.exists():
-        encoded = new_cwd.replace("\\", "-").replace("/", "-").replace(":", "-").replace("_", "-")
-        target_transcript = new_task_dir / ".claude" / "projects" / encoded / f"{new_cli_session_id}.jsonl"
+        # The desktop app looks for `<cliSessionId>.jsonl` under
+        # .claude/projects/session/ first (host-loop sessions run with
+        # CLAUDE_CODE_PROJECT_DIR_NAME=session), then any other subfolder.
+        # Older CLI builds resolve the encoded-cwd folder instead, so the
+        # transcript is also linked there.
+        target_transcript = new_task_dir / ".claude" / "projects" / "session" / f"{new_cli_session_id}.jsonl"
         counts = _rewrite_jsonl(
-            src_transcript, target_transcript, cwd_remap, remaps,
-            src_sep, dst_sep, src_platform,
+            src_transcript, target_transcript, cwd_remap, path_remaps,
+            src_sep, dst_sep, src_platform, fill_cwd=new_cwd, session_id=new_cli_session_id,
         )
+        legacy = new_task_dir / ".claude" / "projects" / encode_project_dir(new_cwd)[:200] / target_transcript.name
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(target_transcript, legacy)
+        except OSError:
+            shutil.copy2(target_transcript, legacy)
         print(
             f"wrote {target_transcript}  "
             f"(records: {counts['records']}, cwd: {counts['cwd']}, "
@@ -2403,7 +2837,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     src_audit = bundle / "audit.jsonl"
     if src_audit.exists():
         counts = _rewrite_jsonl(
-            src_audit, new_task_dir / "audit.jsonl", cwd_remap, remaps,
+            src_audit, new_task_dir / "audit.jsonl", cwd_remap, path_remaps,
             src_sep, dst_sep, src_platform,
         )
         print(
@@ -2443,6 +2877,140 @@ def cmd_import(args: argparse.Namespace) -> int:
     print(f"Done. Restart Cowork desktop; the imported task should appear in the sidebar")
     print(f"with the new task id ({new_task_id}).")
     return 0
+
+
+def _resolve_target_workspace(args: argparse.Namespace) -> Path | None:
+    roots = [Path(args.cowork_root).expanduser().resolve()] if getattr(args, "cowork_root", None) else _cowork_roots()
+    try:
+        return _pick_target_workspace(roots, getattr(args, "workspace", None))[2]
+    except SystemExit as exc:
+        print(exc.args[0] if exc.args else "error", file=sys.stderr)
+        return None
+
+
+def cmd_import_space(args: argparse.Namespace) -> int:
+    """Create (or reuse, by name) a space on the target account from a space
+    bundle: a folder with ``space.json`` and optional ``memory/`` + ``docs/``
+    (what ``convert-claudeai`` writes per project, or a task bundle's ``space/``)."""
+    src = Path(args.space_bundle).expanduser().resolve()
+    sj = src / "space.json"
+    if not sj.exists():
+        print(f"error: {src} has no space.json", file=sys.stderr)
+        return 2
+    workspace = _resolve_target_workspace(args)
+    if workspace is None:
+        return 2
+    if not args.dry_run and not args.allow_running and _desktop_running():
+        print("error: Claude Desktop is running. Quit it first (tray icon → Quit), "
+              "or pass --allow-running.", file=sys.stderr)
+        return 3
+    space = json.loads(sj.read_text(encoding="utf-8"))
+    docs_root = Path(args.docs_root).expanduser().resolve() if args.docs_root else None
+    space_id, created, log = upsert_space(
+        workspace, space, src / "memory", src / "docs", docs_root, dry_run=args.dry_run,
+    )
+    for line in log:
+        print(line)
+    if args.json:
+        print(json.dumps({"space_id": space_id, "created": created, "name": space.get("name")}))
+    return 0
+
+
+def _import_bundle_quiet(bundle: Path, args: argparse.Namespace, space: str) -> tuple[int, str]:
+    """Run cmd_import for one bundle with the bulk command's target options.
+    Returns (exit code, last output line)."""
+    import contextlib
+    import io
+    ns = argparse.Namespace(
+        bundle=str(bundle), cowork_root=getattr(args, "cowork_root", None),
+        workspace=getattr(args, "workspace", None), remap=getattr(args, "remap", None),
+        keep_task_id=False, skip_auth=True, dry_run=args.dry_run, force=False,
+        space=space, allow_running=True, identity=getattr(args, "identity", None),
+    )
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cmd_import(ns)
+    text = (err.getvalue() or out.getvalue()).strip().splitlines()
+    return code, (text[-1] if text else "")
+
+
+def cmd_import_all(args: argparse.Namespace) -> int:
+    """Import every bundle found under a folder: the output of ``export all``
+    (one folder per task) or of ``convert-claudeai`` (projects/ become spaces,
+    conversations/ become tasks)."""
+    root = Path(args.folder).expanduser().resolve()
+    if not root.is_dir():
+        print(f"error: not a folder: {root}", file=sys.stderr)
+        return 2
+    workspace = _resolve_target_workspace(args)
+    if workspace is None:
+        return 2
+    if not args.dry_run and not args.allow_running and _desktop_running():
+        print("error: Claude Desktop is running. Quit it first (tray icon → Quit), "
+              "or pass --allow-running.", file=sys.stderr)
+        return 3
+    if not getattr(args, "workspace", None):
+        args.workspace = str(workspace)
+
+    def emit(event: dict[str, Any]) -> None:
+        if args.progress_json:
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+        else:
+            label = event.get("name") or event.get("bundle") or ""
+            print(f"[{event.get('event')}] {label} {event.get('detail') or ''}".rstrip())
+
+    docs_root = Path(args.docs_root).expanduser().resolve() if args.docs_root else None
+    spaces_done = 0
+    if not args.tasks_only:
+        for sj in sorted((root / "projects").glob("*/space.json")) if (root / "projects").is_dir() else []:
+            space = json.loads(sj.read_text(encoding="utf-8"))
+            sid, created, _ = upsert_space(
+                workspace, space, sj.parent / "memory", sj.parent / "docs", docs_root, dry_run=args.dry_run,
+            )
+            spaces_done += 1
+            emit({"event": "space", "name": space.get("name"), "space_id": sid,
+                  "detail": "created" if created else "reused"})
+        # Account-level memory has no local store and no upload endpoint; the
+        # only memory the desktop app syncs is a space's memory folder. Put it
+        # in its own space so it reaches the new account as project memory.
+        mem = root / "memory"
+        if mem.is_dir() and any(mem.iterdir()):
+            sid, created, _ = upsert_space(
+                workspace,
+                {"name": ACCOUNT_MEMORY_SPACE, "origin": "import",
+                 "instructions": "Memory carried over from the previous Claude account "
+                                 "(areas, topics, people, preferences, profile)."},
+                mem, None, None, dry_run=args.dry_run,
+            )
+            spaces_done += 1
+            emit({"event": "account_memory", "name": ACCOUNT_MEMORY_SPACE, "space_id": sid,
+                  "detail": "created" if created else "reused"})
+
+    bundles = sorted({m.parent for m in root.rglob("manifest.json")
+                      if (m.parent / "transcript.jsonl").exists()})
+    if args.projects_only:
+        bundles = []
+    # Read the target account's identity once (scanning task metadata per
+    # bundle is quadratic on a large import).
+    args.identity = _workspace_identity(workspace)
+    ok = failed = 0
+    total = len(bundles)
+    for i, b in enumerate(bundles, 1):
+        code, last = _import_bundle_quiet(b, args, "auto")
+        if code == 0:
+            ok += 1
+        else:
+            failed += 1
+        emit({"event": "task" if code == 0 else "task_failed", "index": i, "total": total,
+              "bundle": b.name, "detail": "" if code == 0 else last})
+    summary = {"event": "done", "spaces": spaces_done, "tasks_imported": ok, "tasks_failed": failed,
+               "dry_run": bool(args.dry_run), "workspace": str(workspace)}
+    if args.progress_json:
+        print(json.dumps(summary), flush=True)
+    else:
+        print(f"done: spaces={spaces_done} tasks={ok} failed={failed}{' (dry run)' if args.dry_run else ''}")
+        print("Start Claude Desktop signed in to the target account to see them.")
+    return 0 if failed == 0 else 1
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -2764,6 +3332,46 @@ def cmd_seed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_convert_claudeai(args: argparse.Namespace) -> int:
+    import claudeai_export as cae
+    what = {w.strip() for w in args.what.split(",") if w.strip()}
+    bad = what - {"conversations", "projects", "memory", "design", "artifacts", "account"}
+    if bad:
+        print(f"error: unknown --what value(s): {', '.join(sorted(bad))}", file=sys.stderr)
+        return 2
+    formats = [f.strip() for f in args.formats.split(",") if f.strip()] if args.formats else []
+    bad_f = [f for f in formats if f not in SUPPORTED_FORMATS]
+    if bad_f:
+        print(f"error: unknown format(s): {', '.join(bad_f)}", file=sys.stderr)
+        return 2
+
+    def emit(event: dict[str, Any]) -> None:
+        if args.progress_json:
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+        elif event.get("event") == "conversation_done":
+            print(f"[{event['index']}/{event['total']}] {event.get('name') or event['uuid']}")
+        elif event.get("event") == "project_done":
+            kind = event.get("kind") or ""
+            label = {"cowork-space": " — Cowork space (files are in a local folder)",
+                     "instructions-only": " — instructions only", "empty": " — empty"}.get(kind, "")
+            print(f"project: {event.get('name') or event['uuid']}{label}")
+
+    out = Path(args.output).expanduser().resolve()
+    if not args.export and not args.pull:
+        print("error: give an export folder, --pull FILE, or both", file=sys.stderr)
+        return 2
+    counts = cae.convert(
+        Path(args.export) if args.export else None, out, what=what, model=args.model, formats=formats,
+        pull_paths=[Path(p).expanduser().resolve() for p in args.pull or []] or None,
+        since=args.since, match=args.match, limit=args.limit, emit=emit,
+    )
+    if args.progress_json:
+        print(json.dumps({"event": "done", "output": str(out), **counts}, ensure_ascii=False), flush=True)
+    else:
+        print(f"wrote {out}: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cowork_export",
@@ -2914,6 +3522,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="overwrite existing task dir / auth artefacts.",
     )
+    pi.add_argument(
+        "--space", default="auto", metavar="auto|none|SPACE_ID",
+        help="auto (default): recreate the bundle's space on the target account "
+             "(matched by name) and file the task under it; none: no space; "
+             "or an existing target space id.",
+    )
+    pi.add_argument(
+        "--allow-running", action="store_true",
+        help="import even though Claude Desktop is running (it may overwrite the result).",
+    )
     pi.set_defaults(func=cmd_import)
 
     ps = sub.add_parser(
@@ -2942,6 +3560,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="where to write the seed prompt (default: <bundle>/seed-prompt.md)",
     )
     ps.set_defaults(func=cmd_seed)
+
+    target = argparse.ArgumentParser(add_help=False)
+    target.add_argument("--cowork-root", default=None, metavar="PATH",
+                        help="override the auto-detected Cowork sessions root")
+    target.add_argument("--workspace", default=None, metavar="PATH",
+                        help="destination workspace dir (.../<acct>/<org>/); required when more "
+                             "than one account/org exists on this machine")
+    target.add_argument("--docs-root", default=None, metavar="DIR",
+                        help="where project knowledge docs are written (default: ~/Claude/Projects)")
+    target.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
+    target.add_argument("--allow-running", action="store_true",
+                        help="write even though Claude Desktop is running")
+
+    pis = sub.add_parser("import-space", parents=[target],
+                         help="create a space (project) on the target account from a space bundle")
+    pis.add_argument("space_bundle", help="folder with space.json (+ memory/, docs/)")
+    pis.add_argument("--json", action="store_true", help="print the result as JSON")
+    pis.set_defaults(func=cmd_import_space)
+
+    pia = sub.add_parser(
+        "import-all", parents=[target],
+        help="import every bundle in a folder (export-all output or convert-claudeai output)",
+    )
+    pia.add_argument("folder")
+    pia.add_argument("--remap", action="append", metavar="SRC=DST",
+                     help="path remap applied to every bundle (see import --remap)")
+    pia.add_argument("--projects-only", action="store_true", help="only create spaces from projects/")
+    pia.add_argument("--tasks-only", action="store_true", help="only import task / chat bundles")
+    pia.add_argument("--progress-json", action="store_true", help="emit NDJSON progress events")
+    pia.set_defaults(func=cmd_import_all)
+
+    pc = sub.add_parser(
+        "convert-claudeai",
+        help="turn a claude.ai data export into ClaudeLift bundles",
+        description=(
+            "Read a claude.ai 'Export data' download (the folder with the "
+            "conversations-*/projects-*/memories-* zips, or the extracted "
+            "files) and write: one importable bundle per chat under "
+            "conversations/, one space bundle per project under projects/ "
+            "(instructions, knowledge docs, project memory), and account "
+            "memory under memory/."
+        ),
+    )
+    pc.add_argument("export", nargs="?", default=None,
+                    help="export folder (zips or extracted) or a single zip; optional with --pull")
+    pc.add_argument("--pull", action="append", metavar="FILE",
+                    help="live pull file from scripts/pull-claude-projects.js (repeatable). Without it, "
+                         "claude-projects-full-*.json / claudelift-pull-*.json in the export folder "
+                         "(or the newest in Downloads) are used")
+    pc.add_argument("-o", "--output", "--out", dest="output", default=str(DEFAULT_OUTPUT / "claudeai"), metavar="DIR")
+    pc.add_argument(
+        "--what", default="conversations,projects,memory,account,design",
+        help="comma list of conversations,projects,memory,account,design,artifacts "
+             "(default: everything except the large artifacts archive; account needs a live pull)",
+    )
+    pc.add_argument("--formats", default="md", help=f"rendered transcript formats per chat, subset of {','.join(SUPPORTED_FORMATS)} (default: md; empty for none)")
+    pc.add_argument("--model", default="claude-opus-5", help="model recorded on imported chats (default: claude-opus-5)")
+    pc.add_argument("--since", default=None, metavar="ISO_DATE", help="only chats updated on/after this date (e.g. 2026-06-01)")
+    pc.add_argument("--match", default=None, metavar="TEXT", help="only chats whose title contains TEXT")
+    pc.add_argument("--limit", type=int, default=None, help="at most N chats (newest first)")
+    pc.add_argument("--progress-json", action="store_true", help="emit NDJSON progress events on stdout")
+    pc.set_defaults(func=cmd_convert_claudeai)
 
     return p
 
