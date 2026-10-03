@@ -48,6 +48,9 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 | New thread | `POST /v1/code/channels/{chan}/messages` | `{body, client_message_id:<uuid>, attachments?:[{file_id:"file_01…", filename, mime_type}]}` → `{message_id, thread_root_id}` |
 | Threads / timeline | `GET …/threads`, `GET …/timeline?limit=200[&thread_roots_only=true]` | |
 | Session events | `GET /v1/code/sessions/session_…/events?limit=500&sort_order=asc` | shows tool calls (e.g. reads of `/mnt/project-files/…`). |
+| Project folder (Library "Add folder") | `PATCH /v1/code/channels/{chan}` | `{context_sources:[{kind:"local_folder", name}]}` (send the full list; existing entries come back with `path:""`, `url:""`), then upload each file and `files:write` it at `<name>/<rel>`. |
+| Live folder link (settings → environment → Add folder) | `POST /v1/code/channels/{chan}/remote-control-preapproval` | `{enabled:true, environment_id, folder_path}`. The `environment_id` comes from Claude Desktop itself: `RemoteControlServing.requestAddFolder()` opens a folder picker, registers the folder (`POST /v1/environments/bridge` with device keys) and stores it in `remote-control-state.json` per `org:account`. **At most 6 folders per PC** (`remoteControlServeStatusStore.getState()` → `limit: 6`). `GET …/remote-control-preapproval` lists the PC's environments. |
+| Library limits | `GET /v1/code/channels/{chan}/files/usage` | `limit_bytes` 10 GB, `limit_files` 50,000, `limit_file_bytes` 500 MB per project. |
 | Seen, not yet used | `GET /v1/code/project-templates` (`{templates:[]}`), `/v1/code/project-conversions/{id}` (a convert-classic-project feature exists; create call not observed). |
 
 ## 4. How ClaudeLift can reach the signed-in claude.ai page
@@ -96,12 +99,21 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 - Only GET calls until the user approves a write run. Writes go only to the account the user picked; show its email before writing.
 - The new layout needs no Claude Desktop restart; nothing is written to the local Cowork folder.
 
+### 7.1 Limits and traps found in the real run (2026-10-03, 65 projects, ~33,000 files)
+
+- `POST /v1/code/channels` answers **429 "Too many projects created. Retry in Ns."** after about a dozen creates in a row; waiting the asked time works.
+- `POST /api/{org}/upload` answers **413 "Uploaded file too large"** above about 30 MB (28.8 MB passed, 34.7 MB failed), although `files/usage` says 500 MB per file. Larger files must be added by hand (or another upload path, not found).
+- `POST /api/{org}/upload` answers **429 "Exceeded file limits"** (`error.details.error_code: "file_limit_exceeded"`) after about **20,000 uploads in one day**; retrying after seconds does not help. Stop and run again later.
+- `files:write` answers **200 but drops** paths with control characters, garbled UTF-8 (`â\x80\x99`) or invisible characters (U+FE0F); the dropped path is missing from `results`. Clean names first; count a file only when `results` confirms its path.
+- `GET …/memories` returns 20 notes by default; ask `?limit=100`.
+
 ## 8. Open questions
 
 - Plugin and skill upload calls (record them with the recorder while the user uploads one zip in Customize → Plugins / Skills).
 - Whether `/v1/code/project-conversions` can convert a classic project server-side (would replace parts of step 2).
 - Account-level memory location in the new layout (the "Account memory (imported)" project is the fallback).
-- Rate limits for bulk uploads (the proven project: 160 uploads plus 160 re-uploads in one session, no rate-limit errors seen; not measured further).
+- How long the upload limit ("Exceeded file limits") lasts before it resets, and whether the app has an upload path for files over 30 MB.
+- 3 PNG files in one project were dropped by `files:write` with plain names; cause unknown.
 
 ## 9. Acceptance
 
