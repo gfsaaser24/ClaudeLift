@@ -39,7 +39,8 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 | Get project | `GET /v1/code/channels/{chan}` | `{channel:{id,name,agent_id,context_sources,memory_enabled,default_skill_ids,default_plugin_ids,…}}` |
 | Create project | `POST /v1/code/channels` | `{name, visibility:"private", context_sources:[], icon?, color?}`. App adds `context_sources:[{kind:"local_folder", name}]` when a folder is picked (files then live under `<name>/` in the Library). |
 | Instructions | `PATCH /v1/code/channels/{chan}/config` | `{system_prompt_addendum:"…"}`, UI limit 16,000 chars. Config also holds `default_skill_ids`, `default_plugin_ids`, `default_source_urls`, `mcp_servers`, `memory_enabled`, `default_model`. |
-| Upload a file | `POST /api/{org}/upload?store_as_is=true` | multipart field `file`. Response `{file_uuid,…}`. |
+| Upload a Library file (use this) | `POST /v1/code/channels/{chan}/files:beginUpload` → `POST /v1/filestore/fs/createFile` | `beginUpload {size_bytes}` → `{filestore_jwt, upload_path, filesystem_id, max_bytes: 503316480, expires_at (+10 min)}`. Then multipart `params` (JSON blob `{filesystem_id, path: upload_path, media_type}`) + `file`, header `authorization: Bearer <filestore_jwt>` (+ `x-organization-uuid`). Then `files:write {files:[{staged_upload_path: upload_path, path}]}`. Up to 480 MB per file; not counted against the chat upload limit. |
+| Chat attachment upload (do NOT use for the Library) | `POST /api/{org}/upload?store_as_is=true` | multipart `file` → `{file_uuid}`; `files:write` also accepts `source_file_id` (`file_01…`). Refuses > ~30 MB (413) and stops after ~20,000 files a day (429 `file_limit_exceeded`). |
 | File id for Library | — | `file_01` + base58(16 uuid bytes), alphabet `123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`, **left-padded with `1` to 22 chars**. Same scheme as `user_01…` for accounts. |
 | Put files in Library | `POST /v1/code/channels/{chan}/files:write` | `{files:[{path, source_file_id}]}`. Batches of 25 work; one bad id rejects the whole batch (retry one by one). A path that already exists comes back without `entry`. |
 | List Library | `POST /v1/code/channels/{chan}/files:list` | `{recursive:true, limit:500}`; **limit must be 1–500** (501 → 400 "Request validation failed"); `cursor` in the response for more. Also `GET …/files/usage`. |
@@ -102,8 +103,8 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 ### 7.1 Limits and traps found in the real run (2026-10-03, 65 projects, ~33,000 files)
 
 - `POST /v1/code/channels` answers **429 "Too many projects created. Retry in Ns."** after about a dozen creates in a row; waiting the asked time works.
-- `POST /api/{org}/upload` answers **413 "Uploaded file too large"** above about 30 MB (28.8 MB passed, 34.7 MB failed), although `files/usage` says 500 MB per file. Larger files must be added by hand (or another upload path, not found).
-- `POST /api/{org}/upload` answers **429 "Exceeded file limits"** (`error.details.error_code: "file_limit_exceeded"`) after about **20,000 uploads in one day**; retrying after seconds does not help. Stop and run again later.
+- The chat upload `POST /api/{org}/upload` answers **413 "Uploaded file too large"** above about 30 MB. The Library's own upload (`files:beginUpload` + filestore `createFile`, recorded 2026-10-03) takes up to 480 MB; ClaudeLift now uses it.
+- The chat upload also answers **429 "Exceeded file limits"** (`file_limit_exceeded`) after about **20,000 uploads in one day** (still on 10 hours later). The Library upload kept working during that limit.
 - `files:write` answers **200 but drops** paths with control characters, garbled UTF-8 (`â\x80\x99`) or invisible characters (U+FE0F); the dropped path is missing from `results`. Clean names first; count a file only when `results` confirms its path.
 - `GET …/memories` returns 20 notes by default; ask `?limit=100`.
 
@@ -112,7 +113,6 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 - Plugin and skill upload calls (record them with the recorder while the user uploads one zip in Customize → Plugins / Skills).
 - Whether `/v1/code/project-conversions` can convert a classic project server-side (would replace parts of step 2).
 - Account-level memory location in the new layout (the "Account memory (imported)" project is the fallback).
-- How long the upload limit ("Exceeded file limits") lasts before it resets, and whether the app has an upload path for files over 30 MB.
 - 3 PNG files in one project were dropped by `files:write` with plain names; cause unknown.
 
 ## 9. Acceptance

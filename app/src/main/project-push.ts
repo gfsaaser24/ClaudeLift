@@ -47,11 +47,11 @@ export const WRITE_BATCH = 25
 /** files:list accepts limit 1–500 (501 → 400). */
 export const LIST_LIMIT = 500
 /**
- * Larger files are not sent; the user adds them by hand. The upload call
- * answers 413 "Uploaded file too large" above about 30 MB (28.8 MB passed,
- * 34.7 MB failed), although the Library itself allows 500 MB per file.
+ * Larger files are not sent; the user adds them by hand. The Library upload
+ * (`files:beginUpload`) takes up to 480 MB, but each file goes through the
+ * page as one base64 string, so ClaudeLift stops at 150 MB.
  */
-export const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+export const MAX_UPLOAD_BYTES = 150 * 1024 * 1024
 /** Uploads in flight at once. */
 const UPLOAD_CONCURRENCY = 3
 const MAX_LIST_PAGES = 100
@@ -225,24 +225,46 @@ export function apiCallJs(org: string, method: string, url: string, body?: unkno
 })(${lit({ org, method, url, body: body === undefined ? null : body })})`
 }
 
-/** Upload one file (base64) to the org's file store. Resolves `{ok, status, file_uuid, j}`. */
-export function uploadJs(org: string, name: string, mime: string, b64: string): string {
+/**
+ * Upload one file (base64) to a project's Library store, the way the
+ * Library's own upload does it: `files:beginUpload` (a short-lived upload
+ * token and a staging path, up to 480 MB), then `POST /v1/filestore/fs/createFile`
+ * with that token. The caller then `files:write`s `{staged_upload_path, path}`.
+ * (The chat-attachment upload `/api/{org}/upload` is NOT used: it stops at
+ * 30 MB and counts against a daily account file limit.)
+ * Resolves `{ok, status, upload_path, j}`.
+ */
+export function uploadJs(org: string, chan: string, name: string, mime: string, b64: string): string {
   return `(async (a) => {
+  const fail = (status, message) => ({ ok: false, status, upload_path: null, j: { error: { message } } })
   const bin = atob(a.b64)
   const bytes = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  const h = { accept: 'application/json', 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29', 'x-organization-uuid': a.org }
+  let begin
+  try {
+    begin = await fetch('/v1/code/channels/' + encodeURIComponent(a.chan) + '/files:beginUpload', { method: 'POST', credentials: 'include', headers: h, body: JSON.stringify({ size_bytes: bytes.length }) })
+  } catch (e) {
+    return fail(0, 'Network error: ' + String(e && e.message || e))
+  }
+  let b = null
+  try { b = await begin.json() } catch (_) {}
+  if (!begin.ok || !b || typeof b.upload_path !== 'string' || typeof b.filestore_jwt !== 'string') {
+    return { ok: false, status: begin.status, upload_path: null, j: b }
+  }
   const fd = new FormData()
+  fd.append('params', new Blob([JSON.stringify({ filesystem_id: b.filesystem_id, path: b.upload_path, media_type: a.mime })], { type: 'application/json' }))
   fd.append('file', new File([bytes], a.name, { type: a.mime }))
   let r
   try {
-    r = await fetch('/api/' + a.org + '/upload?store_as_is=true', { method: 'POST', credentials: 'include', body: fd })
+    r = await fetch('/v1/filestore/fs/createFile', { method: 'POST', credentials: 'include', headers: { 'x-organization-uuid': a.org, authorization: 'Bearer ' + b.filestore_jwt }, body: fd })
   } catch (e) {
-    return { ok: false, status: 0, file_uuid: null, j: { error: { message: 'Network error: ' + String(e && e.message || e) } } }
+    return fail(0, 'Network error: ' + String(e && e.message || e))
   }
   let j = null
   try { j = await r.json() } catch (_) {}
-  return { ok: r.ok, status: r.status, file_uuid: j && typeof j.file_uuid === 'string' ? j.file_uuid : null, j: r.ok ? null : j }
-})(${lit({ org, name, mime, b64 })})`
+  return { ok: r.ok, status: r.status, upload_path: r.ok ? b.upload_path : null, j: r.ok ? null : j }
+})(${lit({ org, chan, name, mime, b64 })})`
 }
 
 /** Who is signed in: org list and the account email (bootstrap, then account profile). */
@@ -271,7 +293,8 @@ export const WHOAMI_JS = `(async () => {
 // -- receipts ----------------------------------------------------------------
 
 export interface ReceiptProject extends PushProjectResult {
-  files: { path: string; source_file_id: string }[]
+  /** Library paths written in this run, with the staging path each was written from. */
+  files: { path: string; staged_upload_path: string }[]
   memory_ids: string[]
 }
 
@@ -431,13 +454,18 @@ class Api {
     return { ok: res.ok, status: res.status, j: res.j }
   }
 
-  async upload(name: string, mime: string, data: Buffer): Promise<{ ok: boolean; status: number; fileUuid: string | null; error: string | null }> {
+  async upload(
+    chan: string,
+    name: string,
+    mime: string,
+    data: Buffer
+  ): Promise<{ ok: boolean; status: number; uploadPath: string | null; error: string | null }> {
     const b64 = data.toString('base64')
     const res = await this.withRetry(async () => {
-      const raw = (await this.exec.runInPage(uploadJs(this.org, name, mime, b64))) as {
+      const raw = (await this.exec.runInPage(uploadJs(this.org, chan, name, mime, b64))) as {
         ok?: boolean
         status?: number
-        file_uuid?: string | null
+        upload_path?: string | null
         j?: unknown
       } | null
       if (raw === null || typeof raw !== 'object') throw new PushError('crash', 'The claude.ai page gave no answer.')
@@ -447,7 +475,7 @@ class Api {
     return {
       ok: raw.ok === true,
       status: typeof raw.status === 'number' ? raw.status : 0,
-      fileUuid: typeof raw.file_uuid === 'string' ? raw.file_uuid : null,
+      uploadPath: typeof raw.upload_path === 'string' ? raw.upload_path : null,
       error: raw.ok === true ? null : apiErrorText(raw.j)
     }
   }
@@ -789,7 +817,7 @@ async function pushOne(
     return true
   })
   let done = 0
-  const pending: { path: string; source_file_id: string }[] = []
+  const pending: { path: string; staged_upload_path: string }[] = []
   const fail = (f: PushFailure): void => {
     res.library.failed.push(f)
   }
@@ -834,7 +862,7 @@ async function pushOne(
   const poolError: unknown = await pool(todo, UPLOAD_CONCURRENCY, async (f) => {
     checkCancel()
     if (f.size > MAX_UPLOAD_BYTES) {
-      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 30 MB (the claude.ai upload limit). Add it to the project by hand.' })
+      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 150 MB. Add it to the project by hand (the Library takes up to 480 MB).' })
     } else {
       let data: Buffer | null = null
       try {
@@ -844,8 +872,8 @@ async function pushOne(
       }
       if (data !== null) {
         try {
-          const up = await api.upload(basename(f.path), f.mime, data)
-          if (up.ok && up.fileUuid !== null) pending.push({ path: f.path, source_file_id: taggedId('file', up.fileUuid) })
+          const up = await api.upload(chan, basename(f.path), f.mime, data)
+          if (up.ok && up.uploadPath !== null) pending.push({ path: f.path, staged_upload_path: up.uploadPath })
           else fail({ path: f.path, step: 'upload', status: up.status, error: up.error })
         } catch (err) {
           if (err instanceof UploadLimitError) throw err
