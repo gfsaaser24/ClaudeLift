@@ -373,9 +373,24 @@ class Api {
       if (res.status !== 429 || attempt >= MAX_RATE_RETRIES) return res
       const ms = retryDelayMs(res.body)
       this.onWait?.(`claude.ai asks to slow down; waiting ${Math.round(ms / 1000)} s`)
-      await this.sleep(ms)
+      await this.abortableSleep(ms)
       if (this.signal?.aborted === true) throw new PushError('aborted', 'Push cancelled.')
     }
+  }
+
+  /** The back-off wait ends at once on cancel (it can be up to 5 minutes). */
+  private abortableSleep(ms: number): Promise<void> {
+    const signal = this.signal
+    if (signal === null) return this.sleep(ms)
+    if (signal.aborted) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        signal.removeEventListener('abort', done)
+        resolve()
+      }
+      signal.addEventListener('abort', done, { once: true })
+      void this.sleep(ms).then(done, done)
+    })
   }
 
   async call(method: string, url: string, body?: unknown): Promise<ApiAnswer> {
@@ -564,11 +579,13 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
     if (opts.signal.aborted) throw new PushError('aborted', 'Push cancelled.')
   }
 
+  // The project being worked on, so a rate-limit wait shows where it is.
+  let current: { p: PushPlanProject; index: number } | null = null
   progress(null, 0, 'account', 0, 0, `Checking the account in ${exec.label}…`)
   const { account, channels, api } = await readAccount(exec, {
     signal: opts.signal,
     sleep: opts.sleep,
-    onWait: (line) => progress(null, 0, 'checking', 0, 0, line)
+    onWait: (line) => progress(current?.p ?? null, current?.index ?? 0, 'checking', 0, 0, line)
   })
   if (!opts.dryRun) {
     if (opts.expectEmail === null || opts.expectEmail === '') {
@@ -605,6 +622,7 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
     for (const [i, p] of chosen.entries()) {
       checkCancel()
       const index = i + 1
+      current = { p, index }
       progress(p, index, 'checking')
       const decision = decideAction(p.name, p.key, live, prior)
       const res = emptyResult(p, decision.action, decision.chan, decision.reason)

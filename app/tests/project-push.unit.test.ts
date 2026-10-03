@@ -456,6 +456,8 @@ class FakeClaude {
   memoryStatus = 200
   /** The next N project creates answer 429 "Too many projects created. Retry in 12s." */
   rateLimitedCreates = 0
+  /** The next N uploads answer 429 with retry_after 2. */
+  rateLimitedUploads = 0
   private created = 0
 
   fetch = async (url: string, init: FetchInit = {}): Promise<unknown> => {
@@ -491,6 +493,10 @@ class FakeClaude {
       return okJson({ system_prompt_addendum: this.config.get(m[1]) ?? null })
     }
     if (method === 'POST' && path === `/api/${ORG}/upload`) {
+      if (this.rateLimitedUploads > 0) {
+        this.rateLimitedUploads--
+        return okJson({ error: { type: 'rate_limit_error', message: 'Too many uploads.' }, retry_after: 2 }, 429)
+      }
       const file = (body as FakeFormData).entries[0][1] as FakeFile
       const uuid = randomUUID()
       this.uploads.push({ name: file.name, uuid })
@@ -750,6 +756,31 @@ describe('pushPlan', () => {
     const res = await run(fake, plan, { sleep: async () => {} })
     expect(res.projects[0].error).toMatch(/HTTP 429/)
     expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(MAX_RATE_RETRIES + 1)
+  })
+
+  it('waits and retries a rate-limited upload, then writes the file', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedUploads = 2
+    const waits: number[] = []
+    const plan = planOf(await project('p1', 'Upload limited', 1))
+    const res = await run(fake, plan, { sleep: async (ms) => void waits.push(ms) })
+    expect(waits).toEqual([3000, 3000])
+    expect(fake.calls.filter((c) => c.path === `/api/${ORG}/upload`)).toHaveLength(3)
+    expect(res.projects[0].library).toMatchObject({ written: 1, failed: [] })
+    expect(res.projects[0].complete).toBe(true)
+  })
+
+  it('a cancel ends a long 429 wait at once', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = 1
+    const ctl = new AbortController()
+    const plan = planOf(await project('p1', 'Long wait', 1))
+    // A sleep that never ends by itself: only the cancel can end the wait.
+    const pending = run(fake, plan, { signal: ctl.signal, sleep: () => new Promise(() => {}) })
+    await new Promise((r) => setTimeout(r, 50))
+    ctl.abort()
+    const res = await pending
+    expect(res.cancelled).toBe(true)
   })
 
   it('a cancel during the 429 wait stops the run', async () => {
