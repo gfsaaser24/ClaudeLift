@@ -959,7 +959,9 @@ export const PushRunRequestSchema = z.object({
   /** The email the user saw and confirmed; the run stops when the page is signed in to another account. */
   expectEmail: z.string().nullable().optional(),
   /** Also add missing files and notes to projects ClaudeLift made and finished before. */
-  topUp: z.boolean().optional()
+  topUp: z.boolean().optional(),
+  /** Add to projects of the same name that already exist (made by hand); nothing is replaced. */
+  mergeExisting: z.boolean().optional()
 })
 export type PushRunRequest = z.infer<typeof PushRunRequestSchema>
 

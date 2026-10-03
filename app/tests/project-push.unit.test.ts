@@ -834,6 +834,16 @@ describe('pushPlan', () => {
     })
   })
 
+  it('mergeExisting adds to a project of the same name that ClaudeLift did not make', async () => {
+    const fake = new FakeClaude()
+    fake.files.set('chan_E', [])
+    const plan = planOf(await project('p1', 'Existing', 2))
+    const res = await run(fake, plan, { mergeExisting: true })
+    expect(res.projects[0]).toMatchObject({ action: 'resume', chan: 'chan_E', reason: 'Adding to the existing project.' })
+    expect(res.projects[0].library.written).toBe(2)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(0)
+  })
+
   it('topUp resumes a finished ClaudeLift project and adds only new files', async () => {
     const fake = new FakeClaude()
     const first = planOf(await project('p1', 'Grows', 2))

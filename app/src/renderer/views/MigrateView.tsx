@@ -1835,6 +1835,7 @@ function RebuildProjectsCard(): JSX.Element {
   const [includeAccountMemory, setIncludeAccountMemory] = useState(true)
   const [includeLocalFolders, setIncludeLocalFolders] = useState(true)
   const [topUp, setTopUp] = useState(false)
+  const [mergeExisting, setMergeExisting] = useState(false)
   const [planning, setPlanning] = useState(false)
   const [plan, setPlan] = useState<PushPlanSummary | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -1932,7 +1933,8 @@ function RebuildProjectsCard(): JSX.Element {
       executor,
       dryRun,
       expectEmail: account?.email ?? null,
-      topUp
+      topUp,
+      mergeExisting
     })
   }
 
@@ -2211,6 +2213,9 @@ function RebuildProjectsCard(): JSX.Element {
           </label>
           <CheckField checked={topUp} disabled={busy} onChange={setTopUp}>
             Also add new files to projects ClaudeLift already made (nothing is replaced)
+          </CheckField>
+          <CheckField checked={mergeExisting} disabled={busy} onChange={setMergeExisting}>
+            Add to projects that already exist with the same name, even if you made them (nothing is replaced)
           </CheckField>
           <div className="flex flex-wrap items-center gap-2">
             <button

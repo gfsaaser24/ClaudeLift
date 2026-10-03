@@ -156,7 +156,8 @@ export function decideAction(
   key: string,
   channels: readonly ChannelInfo[],
   prior: ReadonlyMap<string, PriorRun>,
-  topUp = false
+  topUp = false,
+  mergeExisting = false
 ): { action: PushAction; chan: string | null; reason: string | null } {
   const wanted = name.trim().toLowerCase()
   const live = channels.find((c) => !c.archived && c.name.trim().toLowerCase() === wanted)
@@ -170,6 +171,7 @@ export function decideAction(
       ? { action: 'skip', chan: live.id, reason: 'Already rebuilt by ClaudeLift.' }
       : { action: 'resume', chan: live.id, reason: 'Made by ClaudeLift earlier; adding what is missing.' }
   }
+  if (mergeExisting) return { action: 'resume', chan: live.id, reason: 'Adding to the existing project.' }
   return { action: 'skip', chan: live.id, reason: 'A project with this name exists.' }
 }
 
@@ -550,6 +552,8 @@ export interface PushRunOptions {
   sleep?: (ms: number) => Promise<void>
   /** Resume finished ClaudeLift projects too (adds only what is missing). */
   topUp?: boolean
+  /** Add to a project of the same name that ClaudeLift did not make (adds only what is missing). */
+  mergeExisting?: boolean
 }
 
 function emptyResult(p: PushPlanProject, action: PushAction, chan: string | null, reason: string | null): ReceiptProject {
@@ -655,7 +659,7 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
       const index = i + 1
       current = { p, index }
       progress(p, index, 'checking')
-      const decision = decideAction(p.name, p.key, live, prior, opts.topUp === true)
+      const decision = decideAction(p.name, p.key, live, prior, opts.topUp === true, opts.mergeExisting === true)
       const res = emptyResult(p, decision.action, decision.chan, decision.reason)
       receipt.projects.push(res)
       if (opts.dryRun || decision.action === 'skip') {
