@@ -27,6 +27,8 @@ import {
   priorRuns,
   projectUrl,
   pushPlan,
+  retryDelayMs,
+  MAX_RATE_RETRIES,
   taggedId,
   uploadJs,
   type ChannelInfo,
@@ -128,6 +130,21 @@ describe('small helpers', () => {
     expect(pickOrg(orgs)).toEqual({ uuid: 'b', name: 'Chat' })
     expect(pickOrg([orgs[0]])).toEqual({ uuid: 'a', name: 'API' })
     expect(pickOrg([])).toBeNull()
+  })
+})
+
+describe('retryDelayMs', () => {
+  it('reads "Retry in Ns" from the error message and adds a second', () => {
+    expect(retryDelayMs({ error: { message: 'Too many projects created. Retry in 12s.' } })).toBe(13_000)
+  })
+  it('prefers a numeric retry_after field', () => {
+    expect(retryDelayMs({ retry_after: 3 })).toBe(4000)
+    expect(retryDelayMs({ error: { retry_after: 2.5, message: 'Retry in 99s' } })).toBe(3500)
+  })
+  it('waits 15 s when the answer says nothing and caps long waits at 5 minutes', () => {
+    expect(retryDelayMs(null)).toBe(15_000)
+    expect(retryDelayMs({ error: { message: 'slow down' } })).toBe(15_000)
+    expect(retryDelayMs({ retry_after: 3600 })).toBe(300_000)
   })
 })
 
@@ -437,6 +454,8 @@ class FakeClaude {
   /** files:write containing one of these paths answers 400. */
   failPaths = new Set<string>()
   memoryStatus = 200
+  /** The next N project creates answer 429 "Too many projects created. Retry in 12s." */
+  rateLimitedCreates = 0
   private created = 0
 
   fetch = async (url: string, init: FetchInit = {}): Promise<unknown> => {
@@ -454,6 +473,10 @@ class FakeClaude {
     if (method === 'GET' && path === '/api/account_profile') return okJson({}, 404)
     if (method === 'GET' && path === '/v1/code/channels') return okJson({ data: this.channels })
     if (method === 'POST' && path === '/v1/code/channels') {
+      if (this.rateLimitedCreates > 0) {
+        this.rateLimitedCreates--
+        return okJson({ error: { type: 'rate_limit_error', message: 'Too many projects created. Retry in 12s.' } }, 429)
+      }
       const id = ++this.created === 1 ? 'chan_X' : `chan_X${this.created}`
       this.channels.push({ id, name: (body as { name: string }).name, archived_at: null })
       this.files.set(id, [])
@@ -706,6 +729,37 @@ describe('pushPlan', () => {
     expect(rp.files).toHaveLength(30)
     for (const f of rp.files) expect(f.source_file_id).toMatch(/^file_01[1-9A-HJ-NP-Za-km-z]{22}$/)
     expect(rp.memory_ids).toEqual(['mem_1'])
+  })
+
+  it('waits and retries when claude.ai rate-limits project creation (429)', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = 2
+    const waits: number[] = []
+    const plan = planOf(await project('p1', 'Limited', 2))
+    const res = await run(fake, plan, { sleep: async (ms) => void waits.push(ms) })
+    expect(waits).toEqual([13_000, 13_000])
+    expect(res.projects[0].error).toBeNull()
+    expect(res.projects[0].complete).toBe(true)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(3)
+  })
+
+  it('gives up after MAX_RATE_RETRIES and reports the 429', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = MAX_RATE_RETRIES + 5
+    const plan = planOf(await project('p1', 'Always limited', 1))
+    const res = await run(fake, plan, { sleep: async () => {} })
+    expect(res.projects[0].error).toMatch(/HTTP 429/)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(MAX_RATE_RETRIES + 1)
+  })
+
+  it('a cancel during the 429 wait stops the run', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = 5
+    const ctl = new AbortController()
+    const plan = planOf(await project('p1', 'Cancelled', 1))
+    const res = await run(fake, plan, { signal: ctl.signal, sleep: async () => ctl.abort() })
+    expect(res.cancelled).toBe(true)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(1)
   })
 
   it('a second real run skips the project it already rebuilt', async () => {

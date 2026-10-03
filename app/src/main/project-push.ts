@@ -319,6 +319,26 @@ function stamp(d: Date = new Date()): string {
 // API over an executor
 // ---------------------------------------------------------------------------
 
+/** How often one call is retried after HTTP 429. */
+export const MAX_RATE_RETRIES = 40
+const DEFAULT_RETRY_MS = 15_000
+const MAX_RETRY_MS = 5 * 60_000
+
+/** Wait asked for by a 429 answer ("Retry in 12s" / retry_after), plus a second; 15 s when it says nothing. */
+export function retryDelayMs(body: unknown): number {
+  const b = body as { retry_after?: unknown; error?: { retry_after?: unknown } } | null
+  const field = b?.retry_after ?? b?.error?.retry_after
+  let sec: number | null = typeof field === 'number' && Number.isFinite(field) ? field : null
+  if (sec === null) {
+    const m = /retry in (\d+(?:\.\d+)?)\s*s/i.exec(apiErrorText(body) ?? '')
+    if (m !== null) sec = Number(m[1])
+  }
+  if (sec === null) return DEFAULT_RETRY_MS
+  return Math.min(MAX_RETRY_MS, Math.max(1000, Math.ceil(sec * 1000) + 1000))
+}
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
 interface ApiAnswer {
   ok: boolean
   status: number
@@ -336,21 +356,49 @@ function asAnswer(raw: unknown): ApiAnswer {
 class Api {
   constructor(
     private readonly exec: PageExecutor,
-    readonly org: string
+    readonly org: string,
+    private readonly signal: AbortSignal | null = null,
+    private readonly sleep: (ms: number) => Promise<void> = defaultSleep,
+    private readonly onWait: ((line: string) => void) | null = null
   ) {}
 
+  /**
+   * Run one page call; on HTTP 429 wait as long as claude.ai asks ("Retry
+   * in 12s"), then try again (MAX_RATE_RETRIES times). Bulk project
+   * creation hits this limit after about a dozen projects.
+   */
+  private async withRetry<T extends { status: number; body: unknown }>(run: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const res = await run()
+      if (res.status !== 429 || attempt >= MAX_RATE_RETRIES) return res
+      const ms = retryDelayMs(res.body)
+      this.onWait?.(`claude.ai asks to slow down; waiting ${Math.round(ms / 1000)} s`)
+      await this.sleep(ms)
+      if (this.signal?.aborted === true) throw new PushError('aborted', 'Push cancelled.')
+    }
+  }
+
   async call(method: string, url: string, body?: unknown): Promise<ApiAnswer> {
-    return asAnswer(await this.exec.runInPage(apiCallJs(this.org, method, url, body)))
+    const res = await this.withRetry(async () => {
+      const a = asAnswer(await this.exec.runInPage(apiCallJs(this.org, method, url, body)))
+      return { ...a, body: a.j }
+    })
+    return { ok: res.ok, status: res.status, j: res.j }
   }
 
   async upload(name: string, mime: string, data: Buffer): Promise<{ ok: boolean; status: number; fileUuid: string | null; error: string | null }> {
-    const raw = (await this.exec.runInPage(uploadJs(this.org, name, mime, data.toString('base64')))) as {
-      ok?: boolean
-      status?: number
-      file_uuid?: string | null
-      j?: unknown
-    } | null
-    if (raw === null || typeof raw !== 'object') throw new PushError('crash', 'The claude.ai page gave no answer.')
+    const b64 = data.toString('base64')
+    const res = await this.withRetry(async () => {
+      const raw = (await this.exec.runInPage(uploadJs(this.org, name, mime, b64))) as {
+        ok?: boolean
+        status?: number
+        file_uuid?: string | null
+        j?: unknown
+      } | null
+      if (raw === null || typeof raw !== 'object') throw new PushError('crash', 'The claude.ai page gave no answer.')
+      return { raw, status: typeof raw.status === 'number' ? raw.status : 0, body: raw.j }
+    })
+    const raw = res.raw
     return {
       ok: raw.ok === true,
       status: typeof raw.status === 'number' ? raw.status : 0,
@@ -415,7 +463,10 @@ class Api {
 }
 
 /** Which account the page is signed in to, plus its live project names. Read-only. */
-export async function readAccount(exec: PageExecutor): Promise<{ account: PushAccount; channels: ChannelInfo[]; api: Api }> {
+export async function readAccount(
+  exec: PageExecutor,
+  opts: { signal?: AbortSignal; sleep?: (ms: number) => Promise<void>; onWait?: (line: string) => void } = {}
+): Promise<{ account: PushAccount; channels: ChannelInfo[]; api: Api }> {
   const who = (await exec.runInPage(WHOAMI_JS)) as {
     orgs?: { uuid: string; name: string | null; capabilities: string[] }[] | null
     email?: string | null
@@ -425,7 +476,7 @@ export async function readAccount(exec: PageExecutor): Promise<{ account: PushAc
   }
   const org = pickOrg(who.orgs)
   if (org === null) throw new PushError('validation', 'The account has no organization.')
-  const api = new Api(exec, org.uuid)
+  const api = new Api(exec, org.uuid, opts.signal ?? null, opts.sleep, opts.onWait ?? null)
   const channels = await api.channels()
   const account: PushAccount = {
     email: typeof who.email === 'string' ? who.email : null,
@@ -451,6 +502,8 @@ export interface PushRunOptions {
   outputDir: string
   signal: AbortSignal
   onProgress: (event: PushProgress) => void
+  /** Test hook for the 429 back-off wait. */
+  sleep?: (ms: number) => Promise<void>
 }
 
 function emptyResult(p: PushPlanProject, action: PushAction, chan: string | null, reason: string | null): ReceiptProject {
@@ -512,7 +565,11 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
   }
 
   progress(null, 0, 'account', 0, 0, `Checking the account in ${exec.label}…`)
-  const { account, channels, api } = await readAccount(exec)
+  const { account, channels, api } = await readAccount(exec, {
+    signal: opts.signal,
+    sleep: opts.sleep,
+    onWait: (line) => progress(null, 0, 'checking', 0, 0, line)
+  })
   if (!opts.dryRun) {
     if (opts.expectEmail === null || opts.expectEmail === '') {
       throw new PushError('validation', 'Check the target account first, then run again.')
