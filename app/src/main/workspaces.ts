@@ -13,7 +13,7 @@
  * the caller passes the roots.
  */
 import { readdir, readFile, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { WorkspaceInfo } from '../shared/ipc'
 
 /** Task metadata files: `local_<id>.json` (case-insensitive). */
@@ -65,7 +65,106 @@ async function readIdentity(file: string): Promise<{ email: string; accountName:
   }
 }
 
-async function describeWorkspace(root: string, accountId: string, orgId: string): Promise<WorkspaceInfo> {
+/**
+ * The account Claude Desktop is signed in to right now: `lastKnownAccountUuid`
+ * in `config.json` next to `local-agent-mode-sessions`. A freshly signed-in
+ * account has an empty workspace (no tasks → no email to show), so this is how
+ * the picker can still point at it.
+ */
+async function signedInAccount(root: string): Promise<string | null> {
+  try {
+    const parsed: unknown = JSON.parse(stripBom(await readFile(join(dirname(root), 'config.json'), 'utf8')))
+    const id = (parsed as Record<string, unknown> | null)?.lastKnownAccountUuid
+    return typeof id === 'string' && id !== '' ? id : null
+  } catch {
+    return null
+  }
+}
+
+export interface CachedAccount {
+  email: string
+  fullName: string | null
+  /** Org uuids this account belongs to (from its memberships). */
+  orgIds: string[]
+}
+
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+/**
+ * Accounts the claude.ai page inside Claude Desktop has cached in its
+ * IndexedDB (the persisted query cache holds the signed-in `account` object:
+ * uuid, email_address, full_name, memberships[].organization.uuid). The data
+ * is V8-serialized; one-byte strings are `"` + length byte + bytes, which is
+ * what the pattern reads. Pure, for tests: takes the raw file bytes.
+ */
+export function parseCachedAccounts(bytes: Buffer): Map<string, CachedAccount> {
+  const out = new Map<string, CachedAccount>()
+  const text = bytes.toString('latin1')
+  const re = new RegExp(`"\\x04uuid"\\x24(${UUID})"\\x0demail_address"([\\x01-\\x7f])`, 'g')
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    const len = m[2].charCodeAt(0)
+    const start = m.index + m[0].length
+    const email = text.slice(start, start + len)
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) continue
+    // full_name follows email_address in the same object.
+    const rest = text.slice(start + len, start + len + 600)
+    const nm = /"\x09full_name"([\x01-\x7f])/.exec(rest)
+    const fullName = nm !== null ? rest.slice(nm.index + nm[0].length, nm.index + nm[0].length + nm[1].charCodeAt(0)) : null
+    // Org uuids listed under this account's memberships (before the next account object).
+    const tail = text.slice(start, start + 20000)
+    const nextAccount = tail.indexOf('email_address', len + 1)
+    const scope = nextAccount > 0 ? tail.slice(0, nextAccount) : tail
+    const orgIds = [...new Set([...scope.matchAll(new RegExp(UUID, 'g'))].map((x) => x[0]))]
+    const prev = out.get(m[1])
+    out.set(m[1], {
+      email,
+      fullName: fullName ?? prev?.fullName ?? null,
+      orgIds: [...new Set([...(prev?.orgIds ?? []), ...orgIds])]
+    })
+  }
+  return out
+}
+
+/** Read every claude.ai IndexedDB blob in Claude Desktop's user-data dir. */
+async function cachedAccounts(userData: string): Promise<Map<string, CachedAccount>> {
+  const merged = new Map<string, CachedAccount>()
+  const base = join(userData, 'IndexedDB', 'https_claude.ai_0.indexeddb.blob')
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > 4) return
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const p = join(dir, e.name)
+      if (e.isDirectory()) {
+        await walk(p, depth + 1)
+      } else if (e.isFile()) {
+        try {
+          if ((await stat(p)).size > 32 * 1024 * 1024) continue
+          for (const [id, acct] of parseCachedAccounts(await readFile(p))) {
+            const prev = merged.get(id)
+            merged.set(id, prev ? { ...acct, orgIds: [...new Set([...prev.orgIds, ...acct.orgIds])] } : acct)
+          }
+        } catch {
+          // unreadable blob: skip
+        }
+      }
+    }
+  }
+  await walk(base, 0)
+  return merged
+}
+
+async function describeWorkspace(
+  root: string,
+  accountId: string,
+  orgId: string,
+  currentAccount: string | null,
+  accounts: Map<string, CachedAccount>
+): Promise<WorkspaceInfo> {
   const path = join(root, accountId, orgId)
   const files = [...(await taskMetaFiles(path)), ...(await taskMetaFiles(join(path, 'agent')))]
 
@@ -86,15 +185,26 @@ async function describeWorkspace(root: string, accountId: string, orgId: string)
     if (identity !== null) break
   }
 
+  // No tasks yet (a freshly signed-in account): fall back to the account the
+  // claude.ai page cached. An org that is not among that account's
+  // memberships is a leftover folder from switching accounts.
+  const cached = accounts.get(accountId)
+  const orgKnown = cached !== undefined && cached.orgIds.length > 0
+  // An empty folder whose org belongs to another (cached) account.
+  const orgOwnedElsewhere =
+    files.length === 0 &&
+    [...accounts.entries()].some(([id, a]) => id !== accountId && a.orgIds.includes(orgId))
   return {
     path,
     root,
     accountId,
     orgId,
-    email: identity?.email ?? null,
-    accountName: identity?.accountName ?? null,
+    email: identity?.email ?? cached?.email ?? null,
+    accountName: identity?.accountName ?? cached?.fullName ?? null,
+    leftover: (orgKnown && !cached.orgIds.includes(orgId)) || orgOwnedElsewhere,
     taskCount: files.length,
-    lastActivityMs: withMtime[0]?.mtimeMs ?? 0
+    lastActivityMs: withMtime[0]?.mtimeMs ?? (await stat(path).then((st) => st.mtimeMs).catch(() => 0)),
+    signedInNow: currentAccount !== null && accountId === currentAccount
   }
 }
 
@@ -102,11 +212,15 @@ async function describeWorkspace(root: string, accountId: string, orgId: string)
 export async function listWorkspaces(roots: string[]): Promise<WorkspaceInfo[]> {
   const out: WorkspaceInfo[] = []
   for (const root of roots) {
+    const current = await signedInAccount(root)
+    const accounts = await cachedAccounts(dirname(root))
     for (const accountId of await subdirs(root)) {
       for (const orgId of await subdirs(join(root, accountId))) {
-        out.push(await describeWorkspace(root, accountId, orgId))
+        out.push(await describeWorkspace(root, accountId, orgId, current, accounts))
       }
     }
   }
-  return out
+  // The account signed in to Claude Desktop now first, leftover folders last.
+  const rank = (w: WorkspaceInfo): number => (w.leftover ? 2 : w.signedInNow ? 0 : 1)
+  return out.sort((a, b) => rank(a) - rank(b) || b.lastActivityMs - a.lastActivityMs)
 }

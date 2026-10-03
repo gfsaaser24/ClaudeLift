@@ -79,7 +79,8 @@ function childPath(dir: string, name: string): string {
 }
 
 function workspaceTitle(ws: WorkspaceInfo): string {
-  return ws.email ?? 'Unknown account (no tasks yet)'
+  if (ws.email !== null) return ws.email
+  return ws.signedInNow ? 'Account signed in to Claude Desktop now (no tasks yet)' : 'Unknown account (no tasks yet)'
 }
 
 function formatDay(ms: number): string {
@@ -235,6 +236,14 @@ function WorkspacePicker({
                     <span className="badge badge-ghost badge-sm">
                       {ws.taskCount} {ws.taskCount === 1 ? 'task' : 'tasks'}
                     </span>
+                    {ws.signedInNow && !ws.leftover && (
+                      <span className="badge badge-success badge-sm">signed in now</span>
+                    )}
+                    {ws.leftover && (
+                      <span className="badge badge-ghost badge-sm" title="This org is not one of the account's organizations; Claude Desktop made the folder while switching accounts.">
+                        leftover folder — not a target
+                      </span>
+                    )}
                     {sourcePath !== undefined && sourcePath === ws.path && (
                       <span className="badge badge-warning badge-sm">source</span>
                     )}

@@ -668,8 +668,12 @@ export const WorkspaceInfoSchema = z.object({
   email: z.string().nullable(),
   accountName: z.string().nullable(),
   taskCount: z.number().int(),
-  /** Newest task metadata mtime (ms epoch), 0 when there are no tasks. */
-  lastActivityMs: z.number()
+  /** Newest task metadata mtime (ms epoch); the folder's mtime when there are no tasks. */
+  lastActivityMs: z.number(),
+  /** The account Claude Desktop is signed in to now (config.json lastKnownAccountUuid). */
+  signedInNow: z.boolean().default(false),
+  /** Org folder that is not one of the account's orgs (left over from switching accounts). */
+  leftover: z.boolean().default(false)
 })
 
 export type WorkspaceInfo = z.infer<typeof WorkspaceInfoSchema>
