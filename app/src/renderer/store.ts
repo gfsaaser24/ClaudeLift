@@ -23,6 +23,8 @@ import {
   AppSettingsSchema,
   BundleInfoSchema,
   ClaudeAiPullProgressSchema,
+  PushProgressSchema,
+  PushRunResultSchema,
   ClaudeAiPullResultSchema,
   ClaudeAiSessionStatusSchema,
   ClaudeConsoleInfoSchema,
@@ -43,6 +45,9 @@ import {
   WatcherStateSchema
 } from '../shared/ipc'
 import type {
+  PushProgress,
+  PushRunRequest,
+  PushRunResult,
   AppSettings,
   AppSettingsPatch,
   BundleInfo,
@@ -194,6 +199,20 @@ export interface ClaudeAiPullState {
   lines: string[]
 }
 
+/**
+ * The project push (Migrate card D) — kept here, not in the view, so moving
+ * to another view never loses a running push or its Cancel button.
+ */
+export interface PushJobState {
+  running: boolean
+  dryRun: boolean
+  progress: PushProgress | null
+  /** Progress lines, oldest first (capped). */
+  log: string[]
+  result: PushRunResult | null
+  error: EngineErrorInfo | null
+}
+
 /** Keep at most this many pull log lines in the store. */
 const PULL_LOG_MAX_LINES = 500
 
@@ -238,6 +257,8 @@ export interface AppState {
   claudeAiSessionChecking: boolean
   /** Sign-in route account pull state (null before the first run). */
   claudeAiPull: ClaudeAiPullState | null
+  /** The project push (card D): live while running, last state after. */
+  push: PushJobState | null
 
   /**
    * One-time app wiring: loadSettings → refreshTasks + refreshBundles +
@@ -331,6 +352,9 @@ export interface AppState {
    */
   runClaudeAiPull(chats: PullChatsMode): Promise<MigrateOutcome<ClaudeAiPullResult>>
   cancelClaudeAiPull(): Promise<void>
+  /** Run (or dry-run) a project push. State lands in `push`. Never throws. */
+  runPush(req: PushRunRequest): Promise<void>
+  cancelPush(): Promise<void>
   pushToast(kind: ToastKind, text: string): void
   dismissToast(id: number): void
   /**
@@ -388,6 +412,7 @@ export const useAppStore = create<AppState>()((set, get) => ({
   claudeAiSession: null,
   claudeAiSessionChecking: false,
   claudeAiPull: null,
+  push: null,
 
   initApp: async () => {
     if (appWired) return
@@ -480,6 +505,18 @@ export const useAppStore = create<AppState>()((set, get) => ({
       if (parsed.data.signedIn && prev?.signedIn !== true) {
         get().pushToast('success', 'Signed in to claude.ai')
       }
+    })
+
+    window.api.onPushProgress((raw) => {
+      const parsed = PushProgressSchema.safeParse(raw)
+      if (!parsed.success) return
+      const evt = parsed.data
+      set((s) => {
+        const cur = s.push
+        if (cur === null || !cur.running) return {}
+        const log = evt.line === null ? cur.log : [...cur.log, evt.line].slice(-PULL_LOG_MAX_LINES)
+        return { push: { ...cur, progress: evt, log } }
+      })
     })
 
     window.api.onClaudeAiPullProgress((raw) => {
@@ -912,6 +949,29 @@ export const useAppStore = create<AppState>()((set, get) => ({
   cancelClaudeAiPull: async () => {
     try {
       await window.api.claudeAiCancel()
+    } catch (err) {
+      get().pushToast('error', `Cancel failed: ${errorText(err)}`)
+    }
+  },
+
+  runPush: async (req) => {
+    if (get().push?.running === true) return
+    set({ push: { running: true, dryRun: req.dryRun, progress: null, log: [], result: null, error: null } })
+    try {
+      const result = PushRunResultSchema.parse(await window.api.pushRun(req))
+      set((s) => ({ push: s.push === null ? null : { ...s.push, running: false, result } }))
+    } catch (err) {
+      const info = parseIpcError(err) ?? { kind: 'crash', message: errorText(err) }
+      if (info.kind === 'aborted') get().pushToast('info', 'Push cancelled')
+      set((s) => ({
+        push: s.push === null ? null : { ...s.push, running: false, error: info.kind === 'aborted' ? null : info }
+      }))
+    }
+  },
+
+  cancelPush: async () => {
+    try {
+      await window.api.pushCancel()
     } catch (err) {
       get().pushToast('error', `Cancel failed: ${errorText(err)}`)
     }

@@ -41,8 +41,6 @@ import {
   PushAccountSchema,
   PushDesktopStatusSchema,
   PushPlanSummarySchema,
-  PushProgressSchema,
-  PushRunResultSchema
 } from '../../shared/ipc'
 import type {
   ClaudeAiPart,
@@ -1786,8 +1784,6 @@ const KIND_LABELS: Record<string, string> = {
   'account-memory': 'account memory'
 }
 
-const MAX_PUSH_LOG = 400
-
 function mb(bytes: number): string {
   return (bytes / (1024 * 1024)).toFixed(1)
 }
@@ -1828,6 +1824,9 @@ function RebuildProjectsCard(): JSX.Element {
   const signIn = useAppStore((s) => s.claudeAiSignIn)
   const signOut = useAppStore((s) => s.claudeAiSignOut)
   const pullRunning = useAppStore((s) => s.claudeAiPull?.running === true)
+  const push = useAppStore((s) => s.push)
+  const runPush = useAppStore((s) => s.runPush)
+  const cancelPush = useAppStore((s) => s.cancelPush)
 
   const [source, setSource] = useState('')
   const [bundles, setBundles] = useState('')
@@ -1846,11 +1845,11 @@ function RebuildProjectsCard(): JSX.Element {
   const [accountError, setAccountError] = useState<EngineErrorInfo | null>(null)
 
   const [dryRun, setDryRun] = useState(true)
-  const [running, setRunning] = useState(false)
-  const [progress, setProgress] = useState<PushProgress | null>(null)
-  const [log, setLog] = useState<string[]>([])
-  const [result, setResult] = useState<PushRunResult | null>(null)
-  const [runError, setRunError] = useState<EngineErrorInfo | null>(null)
+  const running = push?.running === true
+  const progress = push?.progress ?? null
+  const log = push?.log ?? []
+  const result = push?.result ?? null
+  const runError = push?.error ?? null
   const logRef = useRef<HTMLPreElement | null>(null)
 
   // Default source: the converted account folder under the output folder.
@@ -1861,16 +1860,6 @@ function RebuildProjectsCard(): JSX.Element {
   useEffect(() => {
     void refreshSession()
   }, [refreshSession])
-
-  useEffect(() => {
-    return window.api.onPushProgress((raw) => {
-      const parsed = PushProgressSchema.safeParse(raw)
-      if (!parsed.success) return
-      setProgress(parsed.data)
-      const line = parsed.data.line
-      if (line !== null) setLog((prev) => [...prev, line].slice(-MAX_PUSH_LOG))
-    })
-  }, [])
 
   useEffect(() => {
     const el = logRef.current
@@ -1899,7 +1888,6 @@ function RebuildProjectsCard(): JSX.Element {
     setPlanning(true)
     setPlanError(null)
     setPlan(null)
-    setResult(null)
     try {
       const summary = PushPlanSummarySchema.parse(
         await window.api.pushPlan({
@@ -1935,29 +1923,13 @@ function RebuildProjectsCard(): JSX.Element {
 
   const run = async (): Promise<void> => {
     if (plan === null) return
-    setRunning(true)
-    setRunError(null)
-    setResult(null)
-    setLog([])
-    setProgress(null)
-    try {
-      setResult(
-        PushRunResultSchema.parse(
-          await window.api.pushRun({
-            planFile: plan.planFile,
-            keys: plan.projects.filter((p) => selected.has(p.key)).map((p) => p.key),
-            executor,
-            dryRun,
-            expectEmail: account?.email ?? null
-          })
-        )
-      )
-    } catch (err) {
-      const info = ipcErrorInfo(err)
-      if (info.kind !== 'aborted') setRunError(info)
-    } finally {
-      setRunning(false)
-    }
+    await runPush({
+      planFile: plan.planFile,
+      keys: plan.projects.filter((p) => selected.has(p.key)).map((p) => p.key),
+      executor,
+      dryRun,
+      expectEmail: account?.email ?? null
+    })
   }
 
   const toggle = (key: string): void => {
@@ -2240,7 +2212,7 @@ function RebuildProjectsCard(): JSX.Element {
                 : `Write ${chosen.length} projects to ${account?.email ?? '…'}`}
             </button>
             {running && (
-              <button type="button" className="btn btn-error btn-sm" onClick={() => void window.api.pushCancel()}>
+              <button type="button" className="btn btn-error btn-sm" onClick={() => void cancelPush()}>
                 Cancel
               </button>
             )}

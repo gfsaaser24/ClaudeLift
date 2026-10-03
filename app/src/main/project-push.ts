@@ -408,7 +408,7 @@ class Api {
 
   async memoryCount(chan: string): Promise<number> {
     const res = await this.call('GET', `/v1/code/memory/channel/${chan}/memories`)
-    if (!res.ok) return 0
+    if (!res.ok) throw new PushError('crash', `Could not read the memory notes back (HTTP ${res.status}).`)
     const data = (res.j as { data?: unknown } | null)?.data
     return Array.isArray(data) ? data.length : 0
   }
@@ -619,6 +619,8 @@ async function pushOne(
     let keep = false
     if (res.action === 'resume') {
       const cfg = await api.call('GET', `/v1/code/channels/${chan}/config`)
+      // Unknown is not empty: never replace instructions we could not read.
+      if (!cfg.ok) throw new PushError('crash', `Could not read the project settings (HTTP ${cfg.status}).`)
       const j = cfg.j as { system_prompt_addendum?: unknown; config?: { system_prompt_addendum?: unknown } } | null
       const current = j?.system_prompt_addendum ?? j?.config?.system_prompt_addendum
       keep = typeof current === 'string' && current.trim() !== ''
@@ -753,7 +755,8 @@ async function pushOne(
     res.library.failed.length === 0 &&
     res.memory.failed.length === 0 &&
     res.instructions !== 'failed' &&
-    libraryFiles >= p.library.length
+    libraryFiles >= p.library.length &&
+    memoryFiles >= p.memory.length
   progress(
     p,
     index,

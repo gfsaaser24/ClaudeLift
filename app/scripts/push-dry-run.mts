@@ -1,7 +1,7 @@
 // Dev helper: dry-run a push plan against Claude Desktop's claude.ai page
 // through its Main Process Debugger (Developer → Enable Main Process
 // Debugger). GET calls only — it never writes.
-// Usage: npx tsx scripts/push-dry-run.ts <plan.json> <outputDir>
+// Usage: npx tsx scripts/push-dry-run.mts <plan.json> <outputDir>
 import { readFileSync } from 'node:fs'
 import { PushPlanSchema } from '../src/shared/ipc'
 import { openDesktopExecutor } from '../src/main/desktop-inspector'
@@ -9,7 +9,7 @@ import { pushPlan } from '../src/main/project-push'
 
 const [planFile, outputDir] = process.argv.slice(2)
 if (planFile === undefined || outputDir === undefined) {
-  console.error('usage: push-dry-run.ts <plan.json> <outputDir>')
+  console.error('usage: push-dry-run.mts <plan.json> <outputDir>')
   process.exit(2)
 }
 const plan = PushPlanSchema.parse(JSON.parse(readFileSync(planFile, 'utf8')))

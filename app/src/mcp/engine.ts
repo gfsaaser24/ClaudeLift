@@ -28,7 +28,7 @@ const ENGINE_TIMEOUT_MS = 120_000
 const CONVERT_TIMEOUT_MS = 30 * 60_000
 
 /** `convert-claudeai --what` parts accepted by the engine. */
-export const CLAUDEAI_PARTS = ['conversations', 'projects', 'memory', 'design', 'artifacts'] as const
+export const CLAUDEAI_PARTS = ['conversations', 'projects', 'memory', 'design', 'artifacts', 'account'] as const
 export type ClaudeAiPart = (typeof CLAUDEAI_PARTS)[number]
 
 /** Cap on retained stderr (bytes) — engines can be chatty; we only surface the first line. */

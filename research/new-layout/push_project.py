@@ -26,7 +26,11 @@ import base64
 import json
 import mimetypes
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from cowork_export import blank_secrets  # noqa: E402  (shared credential blanking)
 
 INSTRUCTIONS_MAX = 16000
 SECRET = re.compile(
@@ -44,11 +48,14 @@ def safe(s: str) -> str:
 def build_payload(project_dir: Path, include_chats: bool) -> dict:
     meta = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
     account_root = project_dir.parent.parent  # .../claude-account
-    instructions = meta.get("prompt_template") or ""
+    instructions, _n = blank_secrets(meta.get("prompt_template") or "")
     library: list[dict] = []
 
     def add(rel: str, path: Path) -> None:
         data = path.read_bytes()
+        if b"\0" not in data[:8192]:  # text: never upload credentials
+            text, _n = blank_secrets(data.decode("utf-8", errors="surrogateescape"))
+            data = text.encode("utf-8", errors="surrogateescape")
         mime = mimetypes.guess_type(path.name)[0] or ("text/markdown" if path.suffix == ".md" else "application/octet-stream")
         library.append({"path": rel, "name": path.name, "mime": mime, "b64": base64.b64encode(data).decode()})
 
@@ -85,7 +92,7 @@ def build_payload(project_dir: Path, include_chats: bool) -> dict:
     for p in sorted((project_dir / "memory").glob("*")) if (project_dir / "memory").is_dir() else []:
         if not p.is_file() or p.name in SKIP_MEMORY or not p.stat().st_size:
             continue
-        text, n = SECRET.subn("[API key removed by ClaudeLift]", p.read_text(encoding="utf-8", errors="replace"))
+        text, n = blank_secrets(p.read_text(encoding="utf-8", errors="replace"))
         memory.append({"path": "/" + MEMORY_RENAME.get(p.name, p.name), "content": text, "redacted": n})
     return {"name": meta.get("name") or project_dir.name, "instructions": instructions, "library": library, "memory": memory}
 

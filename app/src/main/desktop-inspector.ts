@@ -52,7 +52,8 @@ export function mainProcessWrapper(pageJs: string): string {
   return `(async () => {
   const req = typeof require === 'function' ? require : process.mainModule.require.bind(process.mainModule)
   const { webContents } = req('electron')
-  const wc = webContents.getAllWebContents().find((w) => !w.isDestroyed() && w.getType() === 'window' && w.getURL().startsWith('https://claude.ai'))
+  const isClaude = (u) => { try { return new URL(u).origin === 'https://claude.ai' } catch (_) { return false } }
+  const wc = webContents.getAllWebContents().find((w) => !w.isDestroyed() && w.getType() === 'window' && isClaude(w.getURL()))
   if (!wc) return JSON.stringify({ missing: true })
   const v = await wc.executeJavaScript(${JSON.stringify(pageJs)}, true)
   return JSON.stringify({ v: v === undefined ? null : v })
@@ -64,7 +65,8 @@ export function mainProcessStarter(pageJs: string): string {
   return `(async () => {
   const req = typeof require === 'function' ? require : process.mainModule.require.bind(process.mainModule)
   const { webContents } = req('electron')
-  const wc = webContents.getAllWebContents().find((w) => !w.isDestroyed() && w.getType() === 'window' && w.getURL().startsWith('https://claude.ai'))
+  const isClaude = (u) => { try { return new URL(u).origin === 'https://claude.ai' } catch (_) { return false } }
+  const wc = webContents.getAllWebContents().find((w) => !w.isDestroyed() && w.getType() === 'window' && isClaude(w.getURL()))
   if (!wc) return JSON.stringify({ missing: true })
   wc.executeJavaScript(${JSON.stringify(pageJs)}, true).catch(() => undefined)
   return JSON.stringify({ v: true })

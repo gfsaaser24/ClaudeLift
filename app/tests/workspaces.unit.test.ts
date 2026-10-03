@@ -91,14 +91,14 @@ describe('coalesceWorkspaces', () => {
 
   it('prefers the LocalCache path and takes the newest activity and largest count', () => {
     const out = coalesceWorkspaces([
-      { ...base, root: 'C:\LocalCache\r', path: 'C:\LocalCache\r\A\O', lastActivityMs: 5, leftover: true },
-      { ...base, root: 'C:\Roaming\r', path: 'C:\Roaming\r\A\O', taskCount: 3, lastActivityMs: 9, email: 'e@x.io' }
+      { ...base, root: String.raw`C:\Roaming\r`, path: String.raw`C:\Roaming\r\A\O`, taskCount: 3, lastActivityMs: 9, email: 'e@x.io' },
+      { ...base, root: String.raw`C:\LocalCache\r`, path: String.raw`C:\LocalCache\r\A\O`, lastActivityMs: 5, leftover: true }
     ])
     expect(out).toEqual([
       {
         ...base,
-        root: 'C:\LocalCache\r',
-        path: 'C:\LocalCache\r\A\O',
+        root: String.raw`C:\LocalCache\r`,
+        path: String.raw`C:\LocalCache\r\A\O`,
         taskCount: 3,
         lastActivityMs: 9,
         email: 'e@x.io',
