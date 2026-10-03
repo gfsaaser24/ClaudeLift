@@ -106,7 +106,7 @@ What lands where, per project:
 | Name | Same name. A project whose name is already there is skipped. A Cowork space that has the same name as a claude.ai project becomes "<name> (Cowork)". |
 | Instructions | Project instructions (up to 16,000 characters; longer text is cut there and kept in full as `INSTRUCTIONS (full).md` in the Library) |
 | Knowledge docs | Library, top level |
-| Uploaded files (PDF, XLSX, …) | Library `files/` (the upload call refuses files over about 30 MB; they are listed as failed, add them by hand) |
+| Uploaded files (PDF, XLSX, …) | Library `files/` (files over 150 MB are listed as failed; add them by hand. The Library takes up to 480 MB per file) |
 | Chats of the project | Library `chats/<date> <title>.md` (threads can read them; old chats cannot become threads) |
 | Cowork tasks of the space | Library `cowork/<date> <title>.md` |
 | Project memory | Memory notes (`cloud-memory.md` becomes `/project-memory.md`) |
@@ -117,7 +117,7 @@ What lands where, per project:
 
 File names are cleaned first: garbled characters (for example `â€™` for `’`) are repaired and control characters removed, because claude.ai answers OK for such names but does not store the file. A file counts as written only when claude.ai confirms its exact path.
 
-claude.ai limits each project's Library to 10 GB and 50,000 files; one upload may be at most about 30 MB. If claude.ai asks to slow down (it limits how fast new projects are made), the push waits as long as it asks and goes on.
+claude.ai limits each project's Library to 10 GB, 50,000 files and 480 MB per file. ClaudeLift uploads the way the Library does (files:beginUpload), so the chat upload limits (30 MB, about 20,000 files a day) do not apply. If claude.ai asks to slow down (it limits how fast new projects are made), the push waits as long as it asks and goes on.
 
 **Live folder links** (Project settings → environment → Add folder) are a separate thing: they let threads work in the folder on this PC through Claude Desktop. Claude Desktop allows only **6 linked folders per PC**, and each link needs the folder picker, so ClaudeLift does not make them. Link the folders you work in most by hand.
 
