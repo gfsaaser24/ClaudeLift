@@ -1,6 +1,6 @@
 {
   "name": "claudelift",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Desktop GUI for the cowork_export.py engine - export, import, seed, and Notion-publish Claude Cowork tasks",
   "main": "./out/main/index.js",
   "author": "EditMyPodcast",

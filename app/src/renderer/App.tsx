@@ -15,12 +15,14 @@ import StatusFooter from './components/StatusFooter'
 import ToastHost from './components/ToastHost'
 import TasksView from './views/TasksView'
 import BundlesView from './views/BundlesView'
+import MigrateView from './views/MigrateView'
 import NotionView from './views/NotionView'
 import SettingsView from './views/SettingsView'
 
 const VIEWS: Record<ViewName, () => JSX.Element> = {
   tasks: TasksView,
   bundles: BundlesView,
+  migrate: MigrateView,
   notion: NotionView,
   settings: SettingsView
 }

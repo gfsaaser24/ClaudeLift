@@ -57,6 +57,7 @@ No Python, no command line, nothing to install first. ClaudeLift ships a bundled
 | **Tasks view** | A live, searchable list of every Cowork chat, with batch export. |
 | **Export** | One-click or multi-select export to a portable bundle in the formats you choose. |
 | **Bundles view** | Browse, preview, re-seed, and re-import your exported bundles. |
+| **Migrate** | Move every Cowork chat, space and space memory to another Claude account, or load a claude.ai data export (chats, projects, memory) into Cowork. |
 | **Notion export** | Push any bundle into a Notion database, one page per chat. |
 | **MCP server** | Let Claude Desktop, Claude Code, or Cursor read and export your chats over MCP. |
 | **System tray** | Minimize- or close-to-tray, single instance, quick actions. |
@@ -81,6 +82,23 @@ No Python, no command line, nothing to install first. ClaudeLift ships a bundled
 - **Preview the transcript** in-app without leaving the window.
 - Generate a paste-able **seed prompt** — in `brief`, `standard`, or `full` detail — to resume a chat in a fresh conversation.
 - **Re-import** a bundle back into Cowork, with a guided **folder-remap editor** for moving between machines or paths.
+
+### 🚚 Migrate
+
+- **Move Cowork to another account.** Export every chat, then import it into the other account's Cowork folder. Each chat keeps its space: the space is recreated on the target account (matched by name) with its instructions and memory notes, and Claude Desktop links it to a claude.ai project for that account on the next start.
+- **Import a claude.ai data export.** Point ClaudeLift at the folder from claude.ai → Settings → Privacy → Export data (the `conversations-*.zip`, `projects-*.zip`, `memories-*.zip` files). Each chat becomes a resumable Cowork task, each project becomes a space (instructions, knowledge docs in `~/Claude/Projects/<name>`, project memory), and account memory goes into an "Account memory (imported)" space.
+- **Pull your whole claude.ai account.** The data export leaves out uploaded project files, your personal preferences, skills, which project each chat belongs to, and other organizations. ClaudeLift gets all of it by running `scripts/pull-claude-projects.js` in a claude.ai page: either its own sign-in window (recommended), or Claude Desktop's DevTools (Developer Mode on, then **Developer → Show All Dev Tools**, and use the window titled `Developer Tools - https://claude.ai/…`). See **[docs/CLAUDEAI.md](docs/CLAUDEAI.md)**.
+- Pick the target account from a list (email + task count). Sign in to it in Claude Desktop once first, and **quit Claude Desktop before importing** — it keeps spaces in memory and would overwrite the import. `spaces.json` is backed up before the first change.
+- Dry run by default; nothing is deleted.
+
+The same steps from the command line:
+
+```powershell
+python cowork_export.py export all -o .\account-move                     # every Cowork chat → bundles
+python cowork_export.py convert-claudeai "$HOME\Downloads\Claude Download" -o .\claudeai
+python cowork_export.py import-all .\account-move --workspace <...\local-agent-mode-sessions\<acct>\<org>> --dry-run
+python cowork_export.py import-all .\claudeai     --workspace <...> --dry-run
+```
 
 ### 🔗 Notion export
 
@@ -141,7 +159,7 @@ See **[docs/MCP.md](docs/MCP.md)** for per-client setup (Claude Desktop, Claude 
 
 ## Install
 
-1. Download **`ClaudeLift Setup 0.5.0.exe`** from the [latest Release](../../releases/latest).
+1. Download **`ClaudeLift Setup 0.6.0.exe`** from the [latest Release](../../releases/latest).
 2. Run it. It's a one-click, per-user install and adds a Start Menu shortcut — no admin rights required.
 
 **A note on the signature.** The installer is signed with a self-signed developer certificate. On the developer's own machine it verifies cleanly. On other machines, Windows SmartScreen may show an *"unknown publisher"* notice — click **More info → Run anyway** to proceed. If you'd rather establish trust up front, you can trust the bundled certificate (see [Build from source](#-build-from-source) for the `trust-dev-cert.ps1` helper).

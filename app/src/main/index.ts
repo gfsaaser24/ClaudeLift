@@ -9,6 +9,8 @@
 import { app, BrowserWindow, Notification, dialog, ipcMain, screen, shell } from 'electron'
 import { join } from 'node:path'
 import { EVENT_CHANNELS, type EventChannel } from '../shared/ipc'
+import { cancelPull as cancelClaudeAiPull } from './claudeai-session'
+import { cancelPull } from './devtools-bridge'
 import { EngineService } from './engine'
 import { registerAllHandlers, watcherRootsOverride } from './ipc-handlers'
 import { getStateStore, type StateStore } from './state'
@@ -278,6 +280,9 @@ if (!gotLock) {
       // live engine child is killed whatever command it is running
       // (import/seed/list included), regardless of export tag.
       engine.shutdown()
+      // Abort both pull routes (DevTools console and in-app sign-in).
+      cancelPull()
+      cancelClaudeAiPull()
       void watcher.stop().finally(() => app.quit())
     })
   })

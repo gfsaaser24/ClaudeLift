@@ -250,9 +250,9 @@ function McpServerCard(): JSX.Element {
         <p className="text-sm opacity-70">
           ClaudeLift ships a local Model Context Protocol server so Claude
           Desktop, Claude Code, or Cursor can read and export your Cowork chats
-          straight from the chat window. It exposes six tools: list tasks, get
-          transcript, seed prompt, list bundles, export task, and import bundle
-          (dry-run by default).{' '}
+          straight from the chat window. It exposes seven tools: list tasks, get
+          transcript, seed prompt, list bundles, export task, import bundle
+          (dry-run by default), and convert a claude.ai data export.{' '}
           <a
             className="link link-primary"
             href={MCP_GUIDE_URL}

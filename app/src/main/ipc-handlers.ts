@@ -4,7 +4,10 @@
  * bundles:import, bundles:seed) to registerTaskHandlers, the
  * filesystem-backed bundle channels (bundles:scan/readMarkdown/openFolder)
  * to registerBundleHandlers (Task 12), the notion:* channels to
- * registerNotionHandlers (Task 13), and registers the rest here:
+ * registerNotionHandlers (Task 13), the migrate:* channels to
+ * registerMigrateHandlers, the claudeConsole:* channels to
+ * registerClaudeConsoleHandlers, the claudeAi:* channels to
+ * registerClaudeAiSessionHandlers, and registers the rest here:
  * settings, folder picker, diagnostics.
  *
  * ERROR CONVENTION — identical to register-tasks.ts (its `toIpcError` is
@@ -25,7 +28,10 @@ import {
 } from '../shared/ipc'
 import { EngineError, type EngineService } from './engine'
 import { registerBundleHandlers } from './register-bundles'
+import { registerClaudeConsoleHandlers } from './register-claude-console'
+import { registerClaudeAiSessionHandlers } from './register-claudeai-session'
 import { registerMcpHandlers } from './register-mcp'
+import { registerMigrateHandlers } from './register-migrate'
 import { registerNotionHandlers } from './register-notion'
 import { registerTaskHandlers, type SendToRenderer } from './register-tasks'
 import type { StateStore } from './state'
@@ -165,4 +171,16 @@ export function registerAllHandlers(options: RegisterAllOptions): void {
   // -- mcp server -----------------------------------------------------------------
 
   registerMcpHandlers({ ipcMain, shell })
+
+  // -- migrate (claude.ai conversion, bulk import, workspaces) -------------------
+
+  registerMigrateHandlers({ ipcMain, engine, state, sendToRenderer })
+
+  // -- claude console (Claude Desktop DevTools bridge, Windows only) -------------
+
+  registerClaudeConsoleHandlers({ ipcMain, shell, state, sendToRenderer })
+
+  // -- claude.ai session (ClaudeLift's own claude.ai window) ---------------------
+
+  registerClaudeAiSessionHandlers({ ipcMain, state, sendToRenderer })
 }

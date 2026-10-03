@@ -23,6 +23,8 @@ export const EngineTaskSchema = z.object({
   title: z.string(),
   model: z.string(),
   space_name: z.string(),
+  /** Additive in engine 0.6 — defaults so an older sidecar still parses. */
+  space_id: z.string().default(''),
   cwd: z.string(),
   created_at_ms: z.number().int(),
   last_activity_ms: z.number().int(),
@@ -46,6 +48,7 @@ export const CoworkTaskSchema = z.object({
   title: z.string(),
   model: z.string(),
   spaceName: z.string(),
+  spaceId: z.string(),
   cwd: z.string(),
   createdAtMs: z.number().int(),
   lastActivityMs: z.number().int(),
@@ -72,6 +75,7 @@ export function taskFromEngine(raw: unknown): CoworkTask {
     title: t.title,
     model: t.model,
     spaceName: t.space_name,
+    spaceId: t.space_id,
     cwd: t.cwd,
     createdAtMs: t.created_at_ms,
     lastActivityMs: t.last_activity_ms,
@@ -148,6 +152,24 @@ export type ExportResult = z.infer<typeof ExportResultSchema>
 // Import / seed
 // ---------------------------------------------------------------------------
 
+/**
+ * `--space` value: 'auto' | 'none' | a space id. The id charset is strict
+ * (no leading '-') so a value can never be parsed by argparse as a flag.
+ */
+export const SpaceChoiceSchema = z.union([
+  z.enum(['auto', 'none']),
+  z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'not a valid space id')
+])
+
+export type SpaceChoice = z.infer<typeof SpaceChoiceSchema>
+
+/**
+ * Substring of the engine's exit-3 stderr when import / import-all /
+ * import-space refuses to write because Claude Desktop is running. The
+ * renderer keys its "quit Claude Desktop" guidance on it.
+ */
+export const DESKTOP_RUNNING_MARKER = 'Claude Desktop is running'
+
 export const ImportOptionsSchema = z.object({
   bundleDir: z.string(),
   workspace: z.string().optional(),
@@ -157,7 +179,14 @@ export const ImportOptionsSchema = z.object({
   force: z.boolean(),
   dryRun: z.boolean(),
   /** Optional `--cowork-root` override, mirroring list/export. */
-  coworkRoot: z.string().optional()
+  coworkRoot: z.string().optional(),
+  /**
+   * `--space`: 'auto' (engine default — recreate the bundle's space by name
+   * on the target account), 'none', or an existing target space id.
+   */
+  space: SpaceChoiceSchema.optional(),
+  /** `--allow-running`: import even though Claude Desktop is running. */
+  allowRunning: z.boolean().optional()
 })
 
 export type ImportOptions = z.infer<typeof ImportOptionsSchema>
@@ -427,6 +456,362 @@ export type McpInstallResult = z.infer<typeof McpInstallResultSchema>
 export const McpRevealResultSchema = z.boolean()
 
 // ---------------------------------------------------------------------------
+// Migrate: claude.ai export conversion, bulk import, space import, workspaces
+// ---------------------------------------------------------------------------
+
+/** `convert-claudeai --what` parts. */
+export const ClaudeAiPartSchema = z.enum([
+  'conversations',
+  'projects',
+  'memory',
+  'design',
+  'artifacts',
+  /** Profile, memory, skills list, styles — from a DevTools account pull (`--pull`). */
+  'account'
+])
+export type ClaudeAiPart = z.infer<typeof ClaudeAiPartSchema>
+
+export const ConvertClaudeAiOptionsSchema = z.object({
+  /** The claude.ai "Export data" folder (zips or extracted) or a single zip. */
+  exportDir: z.string().min(1).optional(),
+  /** `-o`: where bundles are written (conversations/, projects/, memory/). */
+  outputDir: z.string().min(1),
+  what: z.array(ClaudeAiPartSchema).min(1),
+  /** `--formats` rendered per chat (engine default md; [] for none). */
+  formats: z.array(ExportFormatSchema),
+  /** `--since`: only chats updated on/after this ISO date (YYYY-MM-DD…). */
+  since: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}/, 'since must be an ISO date (YYYY-MM-DD)')
+    .optional(),
+  /** `--match`: only chats whose title contains this text. */
+  match: z.string().min(1).optional(),
+  /** `--limit`: at most N chats (newest first). */
+  limit: z.number().int().positive().optional(),
+  /**
+   * `--pull PATH` (repeatable): DevTools account-pull JSON files
+   * (`claudelift-pull-<runId>.json`) merged into the conversion.
+   */
+  pull: z.array(z.string().min(1)).optional()
+})
+
+export type ConvertClaudeAiOptions = z.infer<typeof ConvertClaudeAiOptionsSchema>
+
+/** NDJSON events from `convert-claudeai --progress-json`. */
+export const ConvertProgressEventSchema = z.discriminatedUnion('event', [
+  z.object({
+    event: z.literal('project_done'),
+    uuid: z.string(),
+    name: z.string().nullish()
+  }),
+  z.object({
+    event: z.literal('conversation_done'),
+    index: z.number().int(),
+    total: z.number().int(),
+    uuid: z.string(),
+    name: z.string().nullish()
+  }),
+  // Loose: newer engines add counters (e.g. for the `account` part); the
+  // known ones are typed, any extra numeric ones surface as `extra`.
+  z.looseObject({
+    event: z.literal('done'),
+    output: z.string(),
+    conversations: z.number().int(),
+    projects: z.number().int(),
+    memory_files: z.number().int(),
+    design_chats: z.number().int(),
+    artifact_files: z.number().int()
+  })
+])
+
+export type ConvertProgressEvent = z.infer<typeof ConvertProgressEventSchema>
+
+/** Engine `done` keys that ConvertResult maps to named fields. */
+const CONVERT_DONE_KNOWN_KEYS = new Set([
+  'event',
+  'output',
+  'conversations',
+  'projects',
+  'memory_files',
+  'design_chats',
+  'artifact_files'
+])
+
+/** Extra numeric counters on a convert `done` event (keys as the engine sends them). */
+export function convertDoneExtras(done: Record<string, unknown>): Record<string, number> {
+  const extra: Record<string, number> = {}
+  for (const [key, value] of Object.entries(done)) {
+    if (CONVERT_DONE_KNOWN_KEYS.has(key)) continue
+    if (typeof value === 'number' && Number.isFinite(value)) extra[key] = value
+  }
+  return extra
+}
+
+export const ConvertResultSchema = z.object({
+  output: z.string(),
+  conversations: z.number().int(),
+  projects: z.number().int(),
+  memoryFiles: z.number().int(),
+  designChats: z.number().int(),
+  artifactFiles: z.number().int(),
+  /** Any additional numeric counters from the engine's `done` event. */
+  extra: z.record(z.string(), z.number()).default({})
+})
+
+export type ConvertResult = z.infer<typeof ConvertResultSchema>
+
+export const ImportAllOptionsSchema = z.object({
+  /** Folder of bundles: an `export` output dir or a `convert-claudeai` output dir. */
+  folder: z.string().min(1),
+  /** `--workspace`: destination `<root>/<account>/<org>` dir. */
+  workspace: z.string().optional(),
+  coworkRoot: z.string().optional(),
+  /** `--docs-root`: where project knowledge docs go (engine default ~/Claude/Projects). */
+  docsRoot: z.string().optional(),
+  dryRun: z.boolean(),
+  allowRunning: z.boolean(),
+  projectsOnly: z.boolean().optional(),
+  tasksOnly: z.boolean().optional(),
+  remaps: z.array(z.object({ src: z.string(), dst: z.string() })).optional()
+})
+
+export type ImportAllOptions = z.infer<typeof ImportAllOptionsSchema>
+
+/** NDJSON events from `import-all --progress-json`. */
+export const ImportAllProgressEventSchema = z.discriminatedUnion('event', [
+  z.object({
+    event: z.literal('space'),
+    name: z.string().nullish(),
+    space_id: z.string(),
+    detail: z.string()
+  }),
+  z.object({
+    event: z.literal('account_memory'),
+    name: z.string().nullish(),
+    detail: z.string().nullish()
+  }),
+  z.object({
+    event: z.literal('task'),
+    index: z.number().int(),
+    total: z.number().int(),
+    bundle: z.string(),
+    detail: z.string()
+  }),
+  z.object({
+    event: z.literal('task_failed'),
+    index: z.number().int(),
+    total: z.number().int(),
+    bundle: z.string(),
+    detail: z.string()
+  }),
+  z.object({
+    event: z.literal('done'),
+    spaces: z.number().int(),
+    tasks_imported: z.number().int(),
+    tasks_failed: z.number().int(),
+    dry_run: z.boolean(),
+    workspace: z.string()
+  })
+])
+
+export type ImportAllProgressEvent = z.infer<typeof ImportAllProgressEventSchema>
+
+export const ImportAllResultSchema = z.object({
+  spaces: z.number().int(),
+  tasksImported: z.number().int(),
+  tasksFailed: z.number().int(),
+  dryRun: z.boolean(),
+  workspace: z.string()
+})
+
+export type ImportAllResult = z.infer<typeof ImportAllResultSchema>
+
+export const ImportSpaceOptionsSchema = z.object({
+  /** Folder with space.json (+ memory/, docs/). */
+  spaceBundleDir: z.string().min(1),
+  workspace: z.string().optional(),
+  coworkRoot: z.string().optional(),
+  docsRoot: z.string().optional(),
+  dryRun: z.boolean(),
+  allowRunning: z.boolean()
+})
+
+export type ImportSpaceOptions = z.infer<typeof ImportSpaceOptionsSchema>
+
+export const ImportSpaceResultSchema = z.object({
+  spaceId: z.string(),
+  created: z.boolean(),
+  name: z.string().nullable(),
+  /** Engine log lines (the plan on a dry run). */
+  stdout: z.string()
+})
+
+export type ImportSpaceResult = z.infer<typeof ImportSpaceResultSchema>
+
+/** `migrate:listWorkspaces` request — optional root override. */
+export const ListWorkspacesRequestSchema = z.object({
+  coworkRoot: z.string().optional()
+})
+
+export type ListWorkspacesRequest = z.infer<typeof ListWorkspacesRequestSchema>
+
+/**
+ * One Cowork workspace dir on this machine: `<root>/<account>/<org>`.
+ * `email` / `accountName` come from the first `local_*.json` task in it
+ * that records them (null when the workspace has no task yet).
+ */
+export const WorkspaceInfoSchema = z.object({
+  path: z.string(),
+  root: z.string(),
+  accountId: z.string(),
+  orgId: z.string(),
+  email: z.string().nullable(),
+  accountName: z.string().nullable(),
+  taskCount: z.number().int(),
+  /** Newest task metadata mtime (ms epoch); the folder's mtime when there are no tasks. */
+  lastActivityMs: z.number(),
+  /** The account Claude Desktop is signed in to now (config.json lastKnownAccountUuid). */
+  signedInNow: z.boolean().default(false),
+  /** Org folder that is not one of the account's orgs (left over from switching accounts). */
+  leftover: z.boolean().default(false)
+})
+
+export type WorkspaceInfo = z.infer<typeof WorkspaceInfoSchema>
+
+export const ListWorkspacesResultSchema = z.array(WorkspaceInfoSchema)
+
+// ---------------------------------------------------------------------------
+// Claude Desktop DevTools console bridge (Windows only)
+// ---------------------------------------------------------------------------
+
+/** Window rect in physical screen pixels. */
+export const WindowRectSchema = z.object({
+  left: z.number().int(),
+  top: z.number().int(),
+  right: z.number().int(),
+  bottom: z.number().int()
+})
+
+export type WindowRect = z.infer<typeof WindowRectSchema>
+
+/**
+ * `claudeConsole:find` response. `supported` is false off Windows (the
+ * bridge drives Win32 windows); `found` means a visible window titled
+ * "Developer Tools - https://claude.ai…" exists.
+ */
+export const ClaudeConsoleInfoSchema = z.object({
+  supported: z.boolean(),
+  found: z.boolean(),
+  title: z.string().nullable(),
+  rect: WindowRectSchema.nullable(),
+  minimized: z.boolean(),
+  /** Only Claude Desktop's shell DevTools (file:///…app.asar) is open — the wrong one. */
+  shellOnly: z.boolean().default(false)
+})
+
+export type ClaudeConsoleInfo = z.infer<typeof ClaudeConsoleInfoSchema>
+
+/** `claudeConsole:screenshot` response — base64 PNG, null when no window / minimized. */
+export const ClaudeConsoleScreenshotSchema = z.object({
+  png: z.string().nullable()
+})
+
+export type ClaudeConsoleScreenshot = z.infer<typeof ClaudeConsoleScreenshotSchema>
+
+export const PullChatsModeSchema = z.enum(['list', 'full', 'none'])
+export type PullChatsMode = z.infer<typeof PullChatsModeSchema>
+
+/** Run ids land in a file name and in pasted JS — keep the charset tight. */
+export const PullRunIdSchema = z.string().regex(/^[A-Za-z0-9_-]{4,64}$/, 'not a valid run id')
+
+export const ClaudeConsolePullRequestSchema = z.object({
+  runId: PullRunIdSchema,
+  chats: PullChatsModeSchema
+})
+
+export type ClaudeConsolePullRequest = z.infer<typeof ClaudeConsolePullRequestSchema>
+
+export const ClaudeConsolePullResultSchema = z.object({
+  /** Absolute path of `claudelift-pull-<runId>.json`. */
+  file: z.string(),
+  sizeBytes: z.number().int(),
+  /** The folder the file was found in (the user's Downloads folder). */
+  downloadsDir: z.string()
+})
+
+export type ClaudeConsolePullResult = z.infer<typeof ClaudeConsolePullResultSchema>
+
+/** `evt:claudeConsoleProgress` payload, pushed about every 3 s during a pull. */
+export const ClaudeConsoleProgressSchema = z.object({
+  runId: z.string(),
+  /** typing = driving the DevTools window; waiting = watching Downloads; saving = file growing. */
+  phase: z.enum(['typing', 'waiting', 'saving']),
+  elapsedSec: z.number().int(),
+  /** Fresh console screenshot (base64 PNG), null when unavailable. */
+  screenshot: z.string().nullable(),
+  /** Current size of the pull file once it appears, else null. */
+  fileBytes: z.number().int().nullable()
+})
+
+export type ClaudeConsoleProgress = z.infer<typeof ClaudeConsoleProgressSchema>
+
+// ---------------------------------------------------------------------------
+// claude.ai session route: ClaudeLift's own claude.ai window (no Claude Desktop)
+// ---------------------------------------------------------------------------
+
+/**
+ * `claudeAi:status` / `:signIn` / `:signOut` response and `evt:claudeAiStatus`
+ * payload. Read from `GET https://claude.ai/api/organizations` with the
+ * dedicated `persist:claudeai` session; only org names leave the main process.
+ */
+export const ClaudeAiSessionStatusSchema = z.object({
+  signedIn: z.boolean(),
+  /** Names of the organizations the signed-in user belongs to. */
+  orgNames: z.array(z.string()),
+  /** The "Sign in to claude.ai" window is open. */
+  signInWindowOpen: z.boolean(),
+  /** Why the check failed (for example a network error), else null. */
+  error: z.string().nullable()
+})
+
+export type ClaudeAiSessionStatus = z.infer<typeof ClaudeAiSessionStatusSchema>
+
+/** `claudeAi:runPull` request — main picks the output folder from settings.outputDir. */
+export const ClaudeAiPullRequestSchema = z.object({
+  runId: PullRunIdSchema,
+  chats: PullChatsModeSchema
+})
+
+export type ClaudeAiPullRequest = z.infer<typeof ClaudeAiPullRequestSchema>
+
+export const ClaudeAiPullResultSchema = z.object({
+  /** Absolute path of the saved `claudelift-pull-<runId>.json`. */
+  file: z.string(),
+  sizeBytes: z.number().int(),
+  /** `<settings.outputDir>/claude-account-pulls`. */
+  outDir: z.string()
+})
+
+export type ClaudeAiPullResult = z.infer<typeof ClaudeAiPullResultSchema>
+
+/**
+ * `evt:claudeAiPullProgress` payload: a tick about every 3 s, one on each
+ * phase change, and one per `[pull]` console line of the pull script.
+ */
+export const ClaudeAiPullProgressSchema = z.object({
+  runId: z.string(),
+  /** checking = sign-in check; loading = opening claude.ai; running = script; saving = download. */
+  phase: z.enum(['checking', 'loading', 'running', 'saving']),
+  elapsedSec: z.number().int(),
+  /** One `[pull]` console line (prefix and %c styling removed), else null. */
+  line: z.string().nullable(),
+  /** Bytes saved so far once the download started, else null. */
+  fileBytes: z.number().int().nullable()
+})
+
+export type ClaudeAiPullProgress = z.infer<typeof ClaudeAiPullProgressSchema>
+
+// ---------------------------------------------------------------------------
 // Channel names
 // ---------------------------------------------------------------------------
 
@@ -454,7 +839,24 @@ export const INVOKE_CHANNELS = {
   appDiagnostics: 'app:diagnostics',
   mcpInfo: 'mcp:info',
   mcpInstallToClaudeDesktop: 'mcp:installToClaudeDesktop',
-  mcpRevealServer: 'mcp:revealServer'
+  mcpRevealServer: 'mcp:revealServer',
+  migrateListWorkspaces: 'migrate:listWorkspaces',
+  migrateConvertClaudeAi: 'migrate:convertClaudeAi',
+  migrateImportAll: 'migrate:importAll',
+  migrateImportSpace: 'migrate:importSpace',
+  migrateCancel: 'migrate:cancel',
+  claudeConsoleFind: 'claudeConsole:find',
+  claudeConsoleScreenshot: 'claudeConsole:screenshot',
+  claudeConsoleRunPull: 'claudeConsole:runPull',
+  claudeConsoleCancel: 'claudeConsole:cancel',
+  /** Open a folder inside settings.outputDir (the pull's converted output). */
+  claudeConsoleOpenOutput: 'claudeConsole:openOutput',
+  claudeAiStatus: 'claudeAi:status',
+  /** Open the "Sign in to claude.ai" window (focus it when already open). */
+  claudeAiSignIn: 'claudeAi:signIn',
+  claudeAiSignOut: 'claudeAi:signOut',
+  claudeAiRunPull: 'claudeAi:runPull',
+  claudeAiCancel: 'claudeAi:cancel'
 } as const
 
 /** Contract map for the preload's channel-literal duplication (`satisfies`). */
@@ -466,7 +868,12 @@ export const EVENT_CHANNELS = {
   tasksChanged: 'evt:tasksChanged',
   exportProgress: 'evt:exportProgress',
   notionProgress: 'evt:notionProgress',
-  watcherState: 'evt:watcherState'
+  watcherState: 'evt:watcherState',
+  convertProgress: 'evt:convertProgress',
+  importAllProgress: 'evt:importAllProgress',
+  claudeConsoleProgress: 'evt:claudeConsoleProgress',
+  claudeAiStatus: 'evt:claudeAiStatus',
+  claudeAiPullProgress: 'evt:claudeAiPullProgress'
 } as const
 
 export type EventChannelMap = typeof EVENT_CHANNELS
@@ -510,6 +917,32 @@ export interface CoworkExporterApi {
   mcpInfo(): Promise<McpInfo>
   mcpInstallToClaudeDesktop(): Promise<McpInstallResult>
   mcpRevealServer(): Promise<boolean>
+  migrateListWorkspaces(req: ListWorkspacesRequest): Promise<WorkspaceInfo[]>
+  migrateConvertClaudeAi(opts: ConvertClaudeAiOptions): Promise<ConvertResult>
+  migrateImportAll(opts: ImportAllOptions): Promise<ImportAllResult>
+  migrateImportSpace(opts: ImportSpaceOptions): Promise<ImportSpaceResult>
+  /** Kill the running convert-claudeai / import-all (no-op when idle). */
+  migrateCancel(): Promise<void>
+  /** Read-only: is the claude.ai DevTools window of Claude Desktop open? */
+  claudeConsoleFind(): Promise<ClaudeConsoleInfo>
+  /** Read-only: screenshot of that window (no focus change). */
+  claudeConsoleScreenshot(): Promise<ClaudeConsoleScreenshot>
+  /** Type the account-pull script into the DevTools console and wait for its download. */
+  claudeConsoleRunPull(req: ClaudeConsolePullRequest): Promise<ClaudeConsolePullResult>
+  /** Stop waiting for the running pull (no-op when idle). */
+  claudeConsoleCancel(): Promise<void>
+  /** Open dir in Explorer — only folders inside settings.outputDir. */
+  claudeConsoleOpenOutput(req: OpenFolderRequest): Promise<void>
+  /** Read-only: is ClaudeLift's own claude.ai session signed in? */
+  claudeAiStatus(): Promise<ClaudeAiSessionStatus>
+  /** Open the "Sign in to claude.ai" window; later changes arrive on evt:claudeAiStatus. */
+  claudeAiSignIn(): Promise<ClaudeAiSessionStatus>
+  /** Clear the claude.ai session (cookies, storage) and close its windows. */
+  claudeAiSignOut(): Promise<ClaudeAiSessionStatus>
+  /** Run the account-pull script in a hidden claude.ai window and save its download. */
+  claudeAiRunPull(req: ClaudeAiPullRequest): Promise<ClaudeAiPullResult>
+  /** Cancel the running claude.ai pull (no-op when idle). */
+  claudeAiCancel(): Promise<void>
 
   onTasksChanged(cb: () => void): Unsubscribe
   offTasksChanged(cb?: () => void): void
@@ -519,6 +952,16 @@ export interface CoworkExporterApi {
   offNotionProgress(cb?: (state: NotionExportState) => void): void
   onWatcherState(cb: (state: WatcherState) => void): Unsubscribe
   offWatcherState(cb?: (state: WatcherState) => void): void
+  onConvertProgress(cb: (event: ConvertProgressEvent) => void): Unsubscribe
+  offConvertProgress(cb?: (event: ConvertProgressEvent) => void): void
+  onImportAllProgress(cb: (event: ImportAllProgressEvent) => void): Unsubscribe
+  offImportAllProgress(cb?: (event: ImportAllProgressEvent) => void): void
+  onClaudeConsoleProgress(cb: (event: ClaudeConsoleProgress) => void): Unsubscribe
+  offClaudeConsoleProgress(cb?: (event: ClaudeConsoleProgress) => void): void
+  onClaudeAiStatus(cb: (status: ClaudeAiSessionStatus) => void): Unsubscribe
+  offClaudeAiStatus(cb?: (status: ClaudeAiSessionStatus) => void): void
+  onClaudeAiPullProgress(cb: (event: ClaudeAiPullProgress) => void): Unsubscribe
+  offClaudeAiPullProgress(cb?: (event: ClaudeAiPullProgress) => void): void
 }
 
 // ---------------------------------------------------------------------------
@@ -530,4 +973,4 @@ export interface CoworkExporterApi {
  * cowork_export.py). `app:diagnostics` reports this constant instead of
  * spawning the engine for a live probe; bump alongside engine rebuilds.
  */
-export const ENGINE_VERSION = '0.5.0-desktop'
+export const ENGINE_VERSION = '0.6.0-desktop'
