@@ -47,11 +47,11 @@ export const WRITE_BATCH = 25
 /** files:list accepts limit 1–500 (501 → 400). */
 export const LIST_LIMIT = 500
 /**
- * Larger files are not sent; the user adds them by hand. claude.ai allows
- * 500 MB per Library file, but each upload goes through the page as one
- * base64 string, so ClaudeLift stops at 150 MB.
+ * Larger files are not sent; the user adds them by hand. The upload call
+ * answers 413 "Uploaded file too large" above about 30 MB (28.8 MB passed,
+ * 34.7 MB failed), although the Library itself allows 500 MB per file.
  */
-export const MAX_UPLOAD_BYTES = 150 * 1024 * 1024
+export const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 /** Uploads in flight at once. */
 const UPLOAD_CONCURRENCY = 3
 const MAX_LIST_PAGES = 100
@@ -803,7 +803,7 @@ async function pushOne(
   const poolError: unknown = await pool(todo, UPLOAD_CONCURRENCY, async (f) => {
     checkCancel()
     if (f.size > MAX_UPLOAD_BYTES) {
-      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 150 MB. Add it to the project by hand.' })
+      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 30 MB (the claude.ai upload limit). Add it to the project by hand.' })
     } else {
       let data: Buffer | null = null
       try {

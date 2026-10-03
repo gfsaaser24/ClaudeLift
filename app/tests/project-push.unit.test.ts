@@ -916,7 +916,7 @@ describe('pushPlan', () => {
     expect(p.library.written).toBe(1)
     expect(p.library.failed).toHaveLength(1)
     expect(p.library.failed[0]).toMatchObject({ path: '/docs/p1-1.md', step: 'upload', status: null })
-    expect(p.library.failed[0].error).toMatch(/150 MB/)
+    expect(p.library.failed[0].error).toMatch(/30 MB/)
     expect(p.complete).toBe(false)
   })
 
