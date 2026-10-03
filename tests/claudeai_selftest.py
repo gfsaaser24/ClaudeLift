@@ -386,6 +386,7 @@ def main() -> int:
         check(clean_library_path("files/a\u0007b\u009d.md") == "files/ab.md", "control characters removed")
         check(clean_library_path("Caf\u00e9 notes.md") == "Caf\u00e9 notes.md", "real accents kept")
         check(clean_library_path("chats/\u0001/x.md") == "chats/untitled/x.md", "empty segment named untitled")
+        check(clean_library_path("Hooks \u2935\ufe0f x\u200b.html") == "Hooks \u2935 x.html", "invisible characters removed")
 
         print("[6] linked PC folder goes into the Library under its name")
         from claudeai_export import _PlanProject

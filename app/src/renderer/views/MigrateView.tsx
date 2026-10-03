@@ -2279,6 +2279,7 @@ function RebuildProjectsCard(): JSX.Element {
                 <span className="font-semibold">
                   {result.dryRun ? 'Dry run — nothing written. ' : ''}
                   {result.cancelled ? 'Cancelled. ' : ''}
+                  {result.stopped !== null ? `Stopped: ${result.stopped} ` : ''}
                   {result.projects.filter((p) => p.action === 'create').length} to create ·{' '}
                   {result.projects.filter((p) => p.action === 'resume').length} to finish ·{' '}
                   {result.projects.filter((p) => p.action === 'skip').length} skipped (

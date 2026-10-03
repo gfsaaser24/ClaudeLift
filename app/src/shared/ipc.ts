@@ -1006,7 +1006,9 @@ export const PushRunResultSchema = z.object({
   account: PushAccountSchema,
   receiptFile: z.string(),
   projects: z.array(PushProjectResultSchema),
-  cancelled: z.boolean()
+  cancelled: z.boolean(),
+  /** Why the run stopped early (e.g. claude.ai's upload limit), else null. */
+  stopped: z.string().nullable().default(null)
 })
 export type PushRunResult = z.infer<typeof PushRunResultSchema>
 

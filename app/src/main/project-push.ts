@@ -282,6 +282,8 @@ export interface Receipt {
   plan_file: string
   account: PushAccount
   cancelled: boolean
+  /** Why the run stopped early (e.g. the upload limit), else absent. */
+  stopped?: string
   projects: ReceiptProject[]
 }
 
@@ -347,6 +349,23 @@ export function retryDelayMs(body: unknown): number {
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
+/** A 429 that is the account's file upload limit, not a short slow-down: waiting seconds does not help. */
+export function isFileLimit(body: unknown): boolean {
+  const e = (body as { error?: { details?: { error_code?: unknown }; message?: unknown } } | null)?.error
+  return e?.details?.error_code === 'file_limit_exceeded' || /exceeded file limits/i.test(String(e?.message ?? ''))
+}
+
+/** Stops the whole run: claude.ai refuses more uploads for now. What is done stays; run again later. */
+export class UploadLimitError extends PushError {
+  constructor() {
+    super(
+      'crash',
+      "claude.ai's file upload limit for this account is reached (\"Exceeded file limits\"). Everything sent so far is kept. Run the push again later; it adds only what is missing."
+    )
+    this.name = 'UploadLimitError'
+  }
+}
+
 interface ApiAnswer {
   ok: boolean
   status: number
@@ -378,6 +397,7 @@ class Api {
   private async withRetry<T extends { status: number; body: unknown }>(run: () => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       const res = await run()
+      if (res.status === 429 && isFileLimit(res.body)) throw new UploadLimitError()
       if (res.status !== 429 || attempt >= MAX_RATE_RETRIES) return res
       const ms = retryDelayMs(res.body)
       this.onWait?.(`claude.ai asks to slow down; waiting ${Math.round(ms / 1000)} s`)
@@ -649,6 +669,12 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
       } catch (err) {
         if (err instanceof PushError && err.kind === 'aborted') throw err
         res.error = err instanceof Error ? err.message : String(err)
+        if (err instanceof UploadLimitError) {
+          // Every later project would hit the same limit: stop here.
+          progress(p, index, 'done', 0, 0, `${p.name}: stopped — ${res.error}`)
+          receipt.stopped = res.error
+          break
+        }
         progress(p, index, 'done', 0, 0, `${p.name}: failed — ${res.error}`)
       }
       await save()
@@ -666,6 +692,7 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
     account,
     receiptFile,
     cancelled: receipt.cancelled,
+    stopped: receipt.stopped ?? null,
     projects: receipt.projects.map(({ files: _files, memory_ids: _ids, ...rest }) => rest)
   }
 }
@@ -817,6 +844,7 @@ async function pushOne(
           if (up.ok && up.fileUuid !== null) pending.push({ path: f.path, source_file_id: taggedId('file', up.fileUuid) })
           else fail({ path: f.path, step: 'upload', status: up.status, error: up.error })
         } catch (err) {
+          if (err instanceof UploadLimitError) throw err
           // One failed call (e.g. a network drop) fails this file, not the project.
           fail({ path: f.path, step: 'upload', status: null, error: err instanceof Error ? err.message : String(err) })
         }

@@ -461,6 +461,8 @@ class FakeClaude {
   rateLimitedCreates = 0
   /** The next N uploads answer 429 with retry_after 2. */
   rateLimitedUploads = 0
+  /** Every upload answers 429 "Exceeded file limits" (the account's upload limit). */
+  fileLimit = false
   private created = 0
 
   fetch = async (url: string, init: FetchInit = {}): Promise<unknown> => {
@@ -501,6 +503,12 @@ class FakeClaude {
       return okJson({ system_prompt_addendum: this.config.get(m[1]) ?? null })
     }
     if (method === 'POST' && path === `/api/${ORG}/upload`) {
+      if (this.fileLimit) {
+        return okJson(
+          { type: 'error', error: { type: 'rate_limit_error', message: 'Exceeded file limits', details: { error_code: 'file_limit_exceeded' } } },
+          429
+        )
+      }
       if (this.rateLimitedUploads > 0) {
         this.rateLimitedUploads--
         return okJson({ error: { type: 'rate_limit_error', message: 'Too many uploads.' }, retry_after: 2 }, 429)
@@ -838,6 +846,21 @@ describe('pushPlan', () => {
     expect(topped.projects[0].action).toBe('resume')
     expect(fake.uploads.length - before).toBe(2)
     expect(topped.projects[0].library).toMatchObject({ written: 2, existing: 2 })
+  })
+
+  it('stops the whole run at the account upload limit, without waiting', async () => {
+    const fake = new FakeClaude()
+    fake.fileLimit = true
+    const waits: number[] = []
+    const plan = planOf(await project('p1', 'First', 3), await project('p2', 'Second', 1))
+    const res = await run(fake, plan, { sleep: async (ms) => void waits.push(ms) })
+    expect(waits).toEqual([])
+    expect(res.stopped).toMatch(/upload limit/)
+    expect(res.projects).toHaveLength(1)
+    expect(res.projects[0].error).toMatch(/upload limit/)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(1)
+    const receipt = await readReceipt(join(outputDir, PUSH_RECEIPTS_DIR, (await receiptFiles('push-'))[0]))
+    expect(receipt.stopped).toMatch(/upload limit/)
   })
 
   it('a cancel during the 429 wait stops the run', async () => {

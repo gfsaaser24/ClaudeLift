@@ -1255,7 +1255,9 @@ def _dated_name(date: str, title: str) -> str:
     return f"{(date + ' ' if date else '')}{title}"[:120].rstrip(". ") + ".md"
 
 
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Control characters, plus invisible format characters (zero-width, emoji
+# variation selectors, BOM) that claude.ai drops from paths.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2060\ufe0e\ufe0f\ufeff]")
 
 
 def _fix_mojibake(s: str) -> str:
