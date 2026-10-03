@@ -222,5 +222,43 @@ export async function listWorkspaces(roots: string[]): Promise<WorkspaceInfo[]> 
   }
   // The account signed in to Claude Desktop now first, leftover folders last.
   const rank = (w: WorkspaceInfo): number => (w.leftover ? 2 : w.signedInNow ? 0 : 1)
-  return out.sort((a, b) => rank(a) - rank(b) || b.lastActivityMs - a.lastActivityMs)
+  return coalesceWorkspaces(out).sort((a, b) => rank(a) - rank(b) || b.lastActivityMs - a.lastActivityMs)
+}
+
+/** The MSIX package store (`...\LocalCache\Roaming\Claude\...`), the real
+ *  copy behind the `%APPDATA%\Claude` mirror. */
+function isLocalCacheRoot(root: string): boolean {
+  return /[\\/]LocalCache[\\/]/i.test(root)
+}
+
+/**
+ * One entry per account/org. With an MSIX install both the `%APPDATA%` mirror
+ * and the `LocalCache` store can exist, so the same workspace shows up under
+ * two roots. Merge them: the `LocalCache` path wins (writes go there), counts
+ * and activity take the max, identity comes from whichever copy has it, and
+ * the flags are OR-ed. Order of first appearance is kept.
+ */
+export function coalesceWorkspaces(list: WorkspaceInfo[]): WorkspaceInfo[] {
+  const byKey = new Map<string, WorkspaceInfo>()
+  for (const ws of list) {
+    const key = `${ws.accountId.toLowerCase()}/${ws.orgId.toLowerCase()}`
+    const prev = byKey.get(key)
+    if (prev === undefined) {
+      byKey.set(key, ws)
+      continue
+    }
+    const preferNew = isLocalCacheRoot(ws.root) && !isLocalCacheRoot(prev.root)
+    const main = preferNew ? ws : prev
+    const other = preferNew ? prev : ws
+    byKey.set(key, {
+      ...main,
+      email: main.email ?? other.email,
+      accountName: main.accountName ?? other.accountName,
+      taskCount: Math.max(main.taskCount, other.taskCount),
+      lastActivityMs: Math.max(main.lastActivityMs, other.lastActivityMs),
+      signedInNow: main.signedInNow || other.signedInNow,
+      leftover: main.leftover || other.leftover
+    })
+  }
+  return [...byKey.values()]
 }

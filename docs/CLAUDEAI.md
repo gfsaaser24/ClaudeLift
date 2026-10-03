@@ -38,7 +38,7 @@ Endpoints it reads (all under `https://claude.ai`):
 | Organizations | `/api/organizations` |
 | Profile | `/api/account_profile` |
 | Projects | `/api/organizations/{org}/projects?include_harmony_projects=true&limit&offset` |
-| Project detail, docs, files, syncs | `/api/organizations/{org}/projects/{project}[/docs|/files|/syncs]` |
+| Project detail, docs, files, syncs | `/api/organizations/{org}/projects/{project}`, plus `/docs`, `/files`, `/syncs`, `/settings` under it |
 | Uploaded file bytes (any kind, incl. CSV/XLSX "blob" files) | `/api/organizations/{org}/files/{file}/contents` |
 | Memory, memory settings | `/api/organizations/{org}/memory[?project_uuid=]`, `/memory/settings` |
 | Skills, styles | `/api/organizations/{org}/skills/list-skills`, `/list_styles` |

@@ -160,9 +160,23 @@ def _iso_z(ts: str | None) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def _contained(root: Path, rel: str) -> Path | None:
+    """``root / rel`` when ``rel`` is a plain relative path that stays inside
+    ``root`` (no drive, no absolute path, no ``..``); otherwise None."""
+    parts = [p for p in rel.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." or ":" in p for p in parts):
+        return None
+    dest = root.joinpath(*parts)
+    try:
+        dest.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+    return dest
+
+
 def _safe_filename(name: str, fallback: str) -> str:
     name = _SAFE_NAME.sub("_", (name or "").strip()).strip(". ")
-    return (name or fallback)[:150]
+    return (name if name and name != ".." else fallback)[:150]
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -539,17 +553,11 @@ def _pull_list(v: Any) -> list[Any]:
 
 
 def find_project_pulls(export_root: Path, prefix: str = "claude-projects-full") -> list[Path]:
-    """Files from the console pull scripts (``<prefix>-*.json``): in the export
-    folder, or (newest one) in the Downloads folder."""
-    found: list[Path] = []
-    roots = [export_root if export_root.is_dir() else export_root.parent]
-    downloads = Path.home() / "Downloads"
-    for r in roots:
-        found.extend(sorted(r.glob(f"{prefix}*.json")))
-    if not found and downloads.is_dir():
-        newest = sorted(downloads.glob(f"{prefix}*.json"), key=lambda p: p.stat().st_mtime)
-        found.extend(newest[-1:])
-    return found
+    """Files from the console pull scripts (``<prefix>-*.json``) inside the
+    export folder. Pulls anywhere else must be named with --pull: guessing
+    (e.g. the newest file in Downloads) could merge another account's data."""
+    root = export_root if export_root.is_dir() else export_root.parent
+    return sorted(root.glob(f"{prefix}*.json"))
 
 
 @dataclass
@@ -1055,8 +1063,10 @@ def copy_artifacts(ex: ClaudeAiExport, target: Path) -> int:
                 for info in zf.infolist():
                     if info.is_dir() or not info.filename.startswith(prefix):
                         continue
-                    rel = info.filename[len(prefix):]
-                    dest = target / rel
+                    dest = _contained(target, info.filename[len(prefix):])
+                    if dest is None:
+                        print(f"  warn: skipped unsafe path in {src.name}: {info.filename}", file=sys.stderr)
+                        continue
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(info) as fin, dest.open("wb") as fout:
                         shutil.copyfileobj(fin, fout)
@@ -1163,14 +1173,14 @@ def convert(
             proj = proj_info.get(puuid or "")
             space = {"id": puuid, "name": proj.get("name") or puuid, "instructions": proj.get("prompt_template") or "",
                      "origin": "import", "folders": []} if proj else None
-            write_conversation_bundle(c, out / "conversations" / c["uuid"], model, formats, space)
+            write_conversation_bundle(c, out / "conversations" / _safe_filename(str(c["uuid"]), "chat"), model, formats, space)
             counts["conversations"] += 1
             note({"event": "conversation_done", "index": i, "total": total, "uuid": c["uuid"], "name": c.get("name")})
     if "design" in what and ex.design_chats:
         d_out = out / "design_chats"
         d_out.mkdir(parents=True, exist_ok=True)
         for d in ex.design_chats:
-            (d_out / f"{d.get('uuid')}.json").write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+            (d_out / f"{_safe_filename(str(d.get('uuid')), 'design')}.json").write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
             counts["design_chats"] += 1
     if "artifacts" in what:
         counts["artifact_files"] = copy_artifacts(ex, out / "artifacts")

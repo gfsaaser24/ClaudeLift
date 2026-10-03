@@ -1546,6 +1546,33 @@ def _real_path_forms(p: str) -> list[str]:
     return forms
 
 
+def _source_path_forms(p: str, manifest: dict[str, Any], *, same_platform: bool) -> list[str]:
+    """Every spelling of a source sandbox path, worked out from the bundle's
+    own environment (``source_home`` / ``source_userdata``) so a bundle from
+    another Windows profile maps both its %APPDATA% and LocalCache spellings.
+    The importing machine's own MSIX twins are added on the same platform."""
+    if not p:
+        return []
+    forms = [p]
+
+    def add(x: str) -> None:
+        if x and x.lower() not in {f.lower() for f in forms}:
+            forms.append(x)
+
+    home = (manifest.get("source_home") or "").rstrip("\\/")
+    userdata = (manifest.get("source_userdata") or "").rstrip("\\/")
+    if home and userdata and manifest.get("source_platform") == "win32":
+        roaming = home + "\\AppData\\Roaming\\Claude"
+        for a, b in ((userdata, roaming), (roaming, userdata)):
+            if p.lower() == a.lower() or p.lower().startswith(a.lower() + "\\"):
+                add(b + p[len(a):])
+    if same_platform:
+        for f in list(forms):
+            for twin in _real_path_forms(f):
+                add(twin)
+    return forms
+
+
 def encode_project_dir(cwd: str) -> str:
     """Claude Code's ``~/.claude/projects/<name>`` folder name for a cwd:
     every non-alphanumeric character becomes ``-``."""
@@ -2393,16 +2420,66 @@ def _copy_tree_no_clobber(src: Path, dst: Path) -> tuple[int, int]:
         dest = dst / f.relative_to(src)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
-            try:
-                if dest.read_bytes() == f.read_bytes():
-                    skipped += 1
-                    continue
-            except OSError:
-                pass
-            dest = dest.with_name(f"{dest.stem}.imported{dest.suffix}")
+            alt = _free_or_identical(dest, f)
+            if alt is None:
+                skipped += 1
+                continue
+            dest = alt
         shutil.copy2(f, dest)
         copied += 1
     return copied, skipped
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    try:
+        return a.stat().st_size == b.stat().st_size and a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+def _free_or_identical(dest: Path, src: Path) -> Path | None:
+    """For an incoming ``src`` whose name is taken at ``dest``: None when
+    ``dest`` or one of its ``.imported[-N]`` siblings already has the same
+    bytes; otherwise the first unused ``<stem>.imported[-N]<suffix>`` name."""
+    if _same_bytes(dest, src):
+        return None
+    for i in range(1, 1000):
+        cand = dest.with_name(f"{dest.stem}.imported{'' if i == 1 else f'-{i}'}{dest.suffix}")
+        if not cand.exists():
+            return cand
+        if _same_bytes(cand, src):
+            return None
+    raise SystemExit(f"error: too many imported copies of {dest}")
+
+
+def _space_source_key(space: dict[str, Any]) -> str:
+    """Stable identity of the project a space bundle came from: the claude.ai
+    project uuid when known (a migrated Cowork space and the claude.ai project
+    it became are the same thing), else the source space id."""
+    mig = space.get("migration") if isinstance(space.get("migration"), dict) else {}
+    return str(mig.get("projectUuid") or space.get("id") or "")
+
+
+def _import_map_path(workspace: Path) -> Path:
+    """ClaudeLift's own record of which source project became which target
+    space, kept outside Claude's data folder so the app never sees it."""
+    import hashlib
+    key = hashlib.sha256(str(workspace.resolve()).lower().encode("utf-8")).hexdigest()[:16]
+    return HOME / ".claudelift" / "import-map" / f"{key}.json"
+
+
+def _load_import_map(workspace: Path) -> dict[str, str]:
+    try:
+        data = json.loads(_import_map_path(workspace).read_text(encoding="utf-8"))
+        return {str(k): str(v) for k, v in (data.get("spaces") or {}).items()}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def _save_import_map(workspace: Path, mapping: dict[str, str]) -> None:
+    path = _import_map_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(path, {"workspace": str(workspace), "spaces": mapping})
 
 
 def upsert_space(
@@ -2413,9 +2490,17 @@ def upsert_space(
     docs_root: Path | None,
     *,
     dry_run: bool = False,
+    remaps: list[tuple[str, str]] | None = None,
 ) -> tuple[str, bool, list[str]]:
-    """Make sure the target workspace has a space matching ``space`` (by name,
-    case-insensitive) and return (space_id, created, log_lines).
+    """Make sure the target workspace has a space for ``space`` and return
+    (space_id, created, log_lines).
+
+    Matching: a space this tool already made from the same source project
+    (ClaudeLift's import map) is reused; otherwise a same-named space is
+    reused unless it already belongs to a different source project, in which
+    case a new space with a numbered name is made, so two different projects
+    called "Notes" never merge. ``remaps`` (src=dst prefixes) apply to the
+    space's folders.
 
     A new space is written without a ``migration`` record: the desktop app
     treats it like any space created in the UI and links it to a claude.ai
@@ -2432,10 +2517,22 @@ def upsert_space(
         raise SystemExit(f"error: cannot parse {sf}: {e}")
     if not isinstance(data, dict) or not isinstance(data.get("spaces"), list):
         data = {"spaces": []}
-    existing = next(
-        (s for s in data["spaces"] if isinstance(s, dict) and (s.get("name") or "").strip().lower() == name.lower()),
-        None,
-    )
+    spaces = [s for s in data["spaces"] if isinstance(s, dict) and s.get("id")]
+    by_id = {s["id"]: s for s in spaces}
+    imap = _load_import_map(workspace)
+    source = _space_source_key(space)
+    claimed = {v: k for k, v in imap.items()}  # target space id -> source key
+    existing = by_id.get(imap.get(source, "")) if source else None
+    if existing is None:
+        taken = {(s.get("name") or "").strip().lower() for s in spaces}
+        same_name = next((s for s in spaces if (s.get("name") or "").strip().lower() == name.lower()), None)
+        if same_name is not None and claimed.get(same_name["id"], source) in (source, ""):
+            existing = same_name
+        elif same_name is not None:
+            i = 2
+            while f"{name} ({i})".lower() in taken:
+                i += 1
+            name = f"{name} ({i})"
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     created = existing is None
     if existing is None:
@@ -2452,8 +2549,13 @@ def upsert_space(
             "updatedAt": now_ms,
         }
         for fld in space.get("folders") or []:
-            if isinstance(fld, dict) and fld.get("path") and Path(fld["path"]).exists():
-                rec["folders"].append({"path": fld["path"]})
+            if not (isinstance(fld, dict) and fld.get("path")):
+                continue
+            path = _apply_remaps(fld["path"], remaps or [], os.sep, os.sep, sys.platform) if remaps else fld["path"]
+            if Path(path).exists():
+                rec["folders"].append({"path": path})
+            else:
+                log.append(f"space: folder not on this PC, not attached: {path}")
         log.append(f"space: create {name!r} ({rec['id']})")
     else:
         rec = existing
@@ -2503,6 +2605,9 @@ def upsert_space(
             if not backup.exists():
                 shutil.copy2(sf, backup)
         _write_json_atomic(sf, data)
+        if source:
+            imap[source] = rec["id"]
+            _save_import_map(workspace, imap)
     return rec["id"], created, log
 
 
@@ -2705,9 +2810,9 @@ def cmd_import(args: argparse.Namespace) -> int:
     if src_task_dir:
         cwd_remap = (src_task_dir + src_sep + "outputs", new_cwd)
     sandbox_remaps: list[tuple[str, str]] = []
-    for form in _real_path_forms(src_task_dir) if src_platform == dst_platform else ([src_task_dir] if src_task_dir else []):
+    for form in _source_path_forms(src_task_dir, manifest, same_platform=src_platform == dst_platform):
         sandbox_remaps.append((form, new_task_dir_vis))
-    for form in _real_path_forms(src_sandbox) if src_platform == dst_platform else ([src_sandbox] if src_sandbox else []):
+    for form in _source_path_forms(src_sandbox, manifest, same_platform=src_platform == dst_platform):
         sandbox_remaps.append((form, dst_sandbox))
 
     # Space ("project") the task belongs to: rebuilt on the target account
@@ -2760,7 +2865,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     if args.dry_run:
         if space_rec:
             _, _, log = upsert_space(
-                target_workspace, space_rec, bundle / "space" / "memory", None, None, dry_run=True,
+                target_workspace, space_rec, bundle / "space" / "memory", None, None, dry_run=True, remaps=remaps,
             )
             for line in log:
                 print(f"  {line}")
@@ -2790,7 +2895,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     target_space_id = ""
     if space_rec:
         target_space_id, _, log = upsert_space(
-            target_workspace, space_rec, bundle / "space" / "memory", None, None,
+            target_workspace, space_rec, bundle / "space" / "memory", None, None, remaps=remaps,
         )
         for line in log:
             print(line)
@@ -2973,18 +3078,28 @@ def cmd_import_all(args: argparse.Namespace) -> int:
         # Account-level memory has no local store and no upload endpoint; the
         # only memory the desktop app syncs is a space's memory folder. Put it
         # in its own space so it reaches the new account as project memory.
-        mem = root / "memory"
-        if mem.is_dir() and any(mem.iterdir()):
-            sid, created, _ = upsert_space(
-                workspace,
-                {"name": ACCOUNT_MEMORY_SPACE, "origin": "import",
-                 "instructions": "Memory carried over from the previous Claude account "
-                                 "(areas, topics, people, preferences, profile)."},
-                mem, None, None, dry_run=args.dry_run,
-            )
-            spaces_done += 1
-            emit({"event": "account_memory", "name": ACCOUNT_MEMORY_SPACE, "space_id": sid,
-                  "detail": "created" if created else "reused"})
+        # Sources: the data export's memory/ folder, plus each pulled org's
+        # account memory (account/<org>/memory.md), kept apart by org name.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="claudelift-mem-") as tmp:
+            staged = Path(tmp)
+            mem = root / "memory"
+            if mem.is_dir():
+                shutil.copytree(mem, staged, dirs_exist_ok=True)
+            for pulled in sorted((root / "account").glob("*/memory.md")) if (root / "account").is_dir() else []:
+                org_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", pulled.parent.name).strip(". ") or "org"
+                shutil.copy2(pulled, staged / f"account-memory-{org_name}.md")
+            if any(staged.iterdir()):
+                sid, created, _ = upsert_space(
+                    workspace,
+                    {"id": "claudelift-account-memory", "name": ACCOUNT_MEMORY_SPACE, "origin": "import",
+                     "instructions": "Memory carried over from the previous Claude account "
+                                     "(areas, topics, people, preferences, profile)."},
+                    staged, None, None, dry_run=args.dry_run,
+                )
+                spaces_done += 1
+                emit({"event": "account_memory", "name": ACCOUNT_MEMORY_SPACE, "space_id": sid,
+                      "detail": "created" if created else "reused"})
 
     bundles = sorted({m.parent for m in root.rglob("manifest.json")
                       if (m.parent / "transcript.jsonl").exists()})
@@ -3607,8 +3722,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="export folder (zips or extracted) or a single zip; optional with --pull")
     pc.add_argument("--pull", action="append", metavar="FILE",
                     help="live pull file from scripts/pull-claude-projects.js (repeatable). Without it, "
-                         "claude-projects-full-*.json / claudelift-pull-*.json in the export folder "
-                         "(or the newest in Downloads) are used")
+                         "only claude-projects-full-*.json / claudelift-pull-*.json inside the export "
+                         "folder are used; pulls anywhere else must be named here")
     pc.add_argument("-o", "--output", "--out", dest="output", default=str(DEFAULT_OUTPUT / "claudeai"), metavar="DIR")
     pc.add_argument(
         "--what", default="conversations,projects,memory,account,design",

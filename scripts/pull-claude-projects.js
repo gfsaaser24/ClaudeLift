@@ -82,11 +82,29 @@
         const r = await fetch(url, { credentials: 'include' })
         if (!r.ok) continue
         const type = r.headers.get('content-type') || ''
-        if (type.includes('text/html')) continue
-        const blob = await r.blob()
-        if (!blob.size) continue
-        if (blob.size > MAX_FILE_BYTES) return { url, skipped: `too large (${blob.size} bytes)` }
-        return { url, content_type: type, size: blob.size, base64: await toBase64(blob) }
+        if (type.includes('text/html')) { r.body && r.body.cancel(); continue }
+        const declared = Number(r.headers.get('content-length') || 0)
+        if (declared > MAX_FILE_BYTES) {
+          r.body && r.body.cancel()
+          return { url, skipped: `too large (${declared} bytes)` }
+        }
+        // Read in chunks and stop as soon as the cap is passed.
+        const chunks = []
+        let size = 0
+        const reader = r.body.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          size += value.byteLength
+          if (size > MAX_FILE_BYTES) {
+            await reader.cancel()
+            return { url, skipped: `too large (over ${MAX_FILE_BYTES} bytes)` }
+          }
+          chunks.push(value)
+        }
+        if (!size) continue
+        const blob = new Blob(chunks, { type })
+        return { url, content_type: type, size, base64: await toBase64(blob) }
       } catch (_) { /* try the next candidate */ }
     }
     return { error: 'no downloadable URL found', candidates: urls }
@@ -108,10 +126,13 @@
 
     const listed = await listAll(`/api/organizations/${org}/projects?include_harmony_projects=true`)
     if (listed.error) {
-      // API-only / customer orgs have no claude.ai chat surface.
       orgOut.errors.push(listed.error)
-      log(`${o.name}: no chat access (${listed.error.split(' ')[0]}), skipped`)
-      continue
+      if (/^40[13] /.test(listed.error) && listed.items.length === 0) {
+        // API-only / customer orgs have no claude.ai chat surface.
+        log(`${o.name}: no chat access (${listed.error.split(' ')[0]}), skipped`)
+        continue
+      }
+      log(`${o.name}: project list incomplete (${listed.error}); keeping ${listed.items.length} and continuing`)
     }
     orgOut.memory = await tryJson(`/api/organizations/${org}/memory`)
     orgOut.memory_settings = await tryJson(`/api/organizations/${org}/memory/settings`)
@@ -176,7 +197,27 @@
   }
 
   console.table(summary)
-  const blob = new Blob([JSON.stringify(out)], { type: 'application/json' })
+  // Serialize piece by piece (one project at a time): a single
+  // JSON.stringify of the whole account can pass V8's max string length
+  // (~512 MB) once uploaded files are included, and would lose the pull.
+  const parts = []
+  const { organizations, ...head } = out
+  parts.push(JSON.stringify(head).slice(0, -1), ',"organizations":[')
+  organizations.forEach((org, i) => {
+    if (i > 0) parts.push(',')
+    const { projects, chat_bodies, ...orgHead } = org
+    parts.push(JSON.stringify(orgHead).slice(0, -1), ',"projects":[')
+    projects.forEach((pr, j) => { if (j > 0) parts.push(','); parts.push(JSON.stringify(pr)) })
+    parts.push(']')
+    if (chat_bodies) {
+      parts.push(',"chat_bodies":[')
+      chat_bodies.forEach((c, j) => { if (j > 0) parts.push(','); parts.push(JSON.stringify(c)) })
+      parts.push(']')
+    }
+    parts.push('}')
+  })
+  parts.push(']}')
+  const blob = new Blob(parts, { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = opts.runId

@@ -78,6 +78,12 @@ function childPath(dir: string, name: string): string {
   return `${dir.replace(/[\\/]+$/, '')}${sep}${name}`
 }
 
+/** Local `yyyyMMdd-HHmmss`, for a per-run output folder name. */
+function runStamp(d: Date = new Date()): string {
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
 function workspaceTitle(ws: WorkspaceInfo): string {
   if (ws.email !== null) return ws.email
   return ws.signedInNow ? 'Account signed in to Claude Desktop now (no tasks yet)' : 'Unknown account (no tasks yet)'
@@ -1456,15 +1462,26 @@ function ClaudeAccountPullCard({
   const [convertResult, setConvertResult] = useState<ConvertResult | null>(null)
   const [convertError, setConvertError] = useState<EngineErrorInfo | null>(null)
   const [target, setTarget] = useState('')
+  /** This pull's own output folder (`<outputDir>\claude-account\<stamp>`).
+   *  The engine never clears its output, so a shared folder would keep the
+   *  bundles of earlier pulls and the import would bring back stale chats. */
+  const [runDir, setRunDir] = useState<string | null>(null)
 
   const pulling = consolePulling || sessionPulling
   const converting = migrateJob?.kind === 'convert' && migrateJob.owner === 'account'
   const busy = pulling || migrateJob !== null || exportRunning
-  const outputDir = settings !== null ? childPath(settings.outputDir, 'claude-account') : ''
+  const accountDir = settings !== null ? childPath(settings.outputDir, 'claude-account') : ''
 
   const convert = async (file: string): Promise<void> => {
     setConvertResult(null)
     setConvertError(null)
+    if (accountDir === '') {
+      pushToast('error', 'Settings are not loaded yet. Try again in a moment.')
+      return
+    }
+    // A fresh folder for every conversion, so no old bundles get mixed in.
+    const outputDir = childPath(accountDir, runStamp())
+    setRunDir(outputDir)
     const hasExport = exportDir.trim() !== ''
     // Chats come from the export (with their project links from the pull's
     // chat list) and/or from a full-history pull.
@@ -1489,6 +1506,7 @@ function ClaudeAccountPullCard({
 
   const onPullStart = (): void => {
     setPullFile(null)
+    setRunDir(null)
     setConvertResult(null)
     setConvertError(null)
   }
@@ -1501,7 +1519,7 @@ function ClaudeAccountPullCard({
 
   const openOutput = async (): Promise<void> => {
     try {
-      await window.api.claudeConsoleOpenOutput({ dir: convertResult?.output ?? outputDir })
+      await window.api.claudeConsoleOpenOutput({ dir: convertResult?.output ?? runDir ?? accountDir })
     } catch (err) {
       pushToast('error', `Could not open the folder: ${errorText(err)}`)
     }
@@ -1552,8 +1570,8 @@ function ClaudeAccountPullCard({
         {route === 'signin' ? <SignInPullSteps {...routeProps} /> : <DevToolsPullSteps {...routeProps} />}
 
         <Step n={3} title="Convert into bundles" done={convertResult !== null}>
-          <p className="truncate font-mono text-xs text-base-content/60" title={outputDir}>
-            Output: {outputDir}
+          <p className="truncate font-mono text-xs text-base-content/60" title={runDir ?? accountDir}>
+            Output: {runDir ?? childPath(accountDir, '<date-time of this pull>')}
           </p>
           {converting && (
             <div className="flex flex-col gap-1">
@@ -1619,7 +1637,7 @@ function ClaudeAccountPullCard({
         <Step n={5} title="Import into the target account">
           <ImportAllStep
             owner="account"
-            folder={convertResult !== null ? convertResult.output : outputDir}
+            folder={convertResult?.output ?? runDir ?? ''}
             workspace={target}
             workspaceEmail={targetEmail}
           />
