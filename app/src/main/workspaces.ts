@@ -158,6 +158,24 @@ async function cachedAccounts(userData: string): Promise<Map<string, CachedAccou
   return merged
 }
 
+async function exists(path: string): Promise<boolean> {
+  return stat(path).then(
+    () => true,
+    () => false
+  )
+}
+
+/**
+ * New layout (projects and threads in the cloud): Claude Desktop keeps only
+ * `remote-session-spaces.json` (and rpm/, scheduled tasks) here — no
+ * `spaces.json` and no Cowork task files. Writing spaces or tasks into such
+ * a folder does not create projects; the work must go through claude.ai
+ * (Migrate card D). See docs/NEW-LAYOUT-SPEC.md.
+ */
+export function isNewLayout(markers: { spacesJson: boolean; remoteSessionSpaces: boolean; taskCount: number }): boolean {
+  return !markers.spacesJson && markers.taskCount === 0 && markers.remoteSessionSpaces
+}
+
 async function describeWorkspace(
   root: string,
   accountId: string,
@@ -205,7 +223,12 @@ async function describeWorkspace(
     leftover: (orgKnown && !cached.orgIds.includes(orgId)) || orgOwnedElsewhere,
     taskCount: files.length,
     lastActivityMs: withMtime[0]?.mtimeMs ?? (await stat(path).then((st) => st.mtimeMs).catch(() => 0)),
-    signedInNow: currentAccount !== null && accountId === currentAccount
+    signedInNow: currentAccount !== null && accountId === currentAccount,
+    newLayout: isNewLayout({
+      spacesJson: await exists(join(path, 'spaces.json')),
+      remoteSessionSpaces: await exists(join(path, 'remote-session-spaces.json')),
+      taskCount: files.length
+    })
   }
 }
 
@@ -258,7 +281,8 @@ export function coalesceWorkspaces(list: WorkspaceInfo[]): WorkspaceInfo[] {
       taskCount: Math.max(main.taskCount, other.taskCount),
       lastActivityMs: Math.max(main.lastActivityMs, other.lastActivityMs),
       signedInNow: main.signedInNow || other.signedInNow,
-      leftover: main.leftover || other.leftover
+      leftover: main.leftover || other.leftover,
+      newLayout: (main.newLayout || other.newLayout) && Math.max(main.taskCount, other.taskCount) === 0
     })
   }
   return [...byKey.values()]

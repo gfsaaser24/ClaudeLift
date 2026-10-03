@@ -18,6 +18,7 @@
 import { app } from 'electron'
 import { spawn, execFile } from 'node:child_process'
 import type { ChildProcessByStdio } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
 import PQueue from 'p-queue'
@@ -26,6 +27,7 @@ import {
   convertDoneExtras,
   ImportAllProgressEventSchema,
   ProgressEventSchema,
+  PushPlanSchema,
   taskFromEngine,
   type ConvertClaudeAiOptions,
   type ConvertProgressEvent,
@@ -41,6 +43,8 @@ import {
   type ImportSpaceOptions,
   type ImportSpaceResult,
   type ProgressEvent,
+  type PushPlan,
+  type PushPlanRequest,
   type SeedOptions,
   type SeedResult,
   type TaskSource
@@ -441,6 +445,36 @@ export class EngineService {
         name: typeof parsed.name === 'string' ? parsed.name : null,
         stdout: lines.slice(0, -1).join('\n')
       }
+    })
+  }
+
+  /**
+   * `plan-push`: write the plan of what to rebuild in a new-layout account
+   * to `planFile` (engine-side key blanking included) and return it parsed.
+   * Read-only on the source folder; staging copies go next to the plan.
+   */
+  planPush(req: PushPlanRequest, planFile: string): Promise<PushPlan> {
+    return this.queue.add(async () => {
+      const args = ['plan-push', '--source', resolve(req.source), '--out', resolve(planFile)]
+      if (req.coworkBundles !== undefined) args.push('--cowork-bundles', resolve(req.coworkBundles))
+      if (!req.includeChats) args.push('--no-chats')
+      if (req.includeUnfiledChats) args.push('--include-unfiled-chats')
+      if (!req.includeAccountMemory) args.push('--no-account-memory')
+      for (const org of req.orgs) args.push(`--org=${org}`)
+      const result = await this.run(args)
+      if (result.code !== 0) throw engineErrorFromExit(result.code, result.stderr)
+      let raw: unknown
+      try {
+        raw = JSON.parse(await readFile(resolve(planFile), 'utf8'))
+      } catch (err) {
+        throw new EngineError(-1, 'crash', `plan-push wrote no readable plan: ${err instanceof Error ? err.message : String(err)}
+${result.stderr}`)
+      }
+      const parsed = PushPlanSchema.safeParse(raw)
+      if (!parsed.success) {
+        throw new EngineError(-1, 'crash', `plan-push wrote a plan ClaudeLift cannot read: ${parsed.error.message.slice(0, 1000)}`)
+      }
+      return parsed.data
     })
   }
 

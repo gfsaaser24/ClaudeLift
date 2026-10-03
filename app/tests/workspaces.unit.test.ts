@@ -8,8 +8,8 @@ import { coalesceWorkspaces, listWorkspaces, parseCachedAccounts } from '../src/
 const str = (s: string): string => `"${String.fromCharCode(s.length)}${s}`
 
 describe('parseCachedAccounts', () => {
-  const acct = '5bf3f70f-a50b-4d20-b413-dc90b7a9cfca'
-  const org = 'c7958373-168b-4bb6-865a-a3ac5b60c76d'
+  const acct = '3f2a9c41-7d1e-4b6a-9e2f-8c5d1a0b7e64'
+  const org = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
 
   it('reads uuid, email, name and membership orgs of the cached account', () => {
     const blob =
@@ -91,14 +91,14 @@ describe('coalesceWorkspaces', () => {
 
   it('prefers the LocalCache path and takes the newest activity and largest count', () => {
     const out = coalesceWorkspaces([
-      { ...base, root: 'C:\LocalCache\r', path: 'C:\LocalCache\r\A\O', lastActivityMs: 5, leftover: true },
-      { ...base, root: 'C:\Roaming\r', path: 'C:\Roaming\r\A\O', taskCount: 3, lastActivityMs: 9, email: 'e@x.io' }
+      { ...base, root: String.raw`C:\Roaming\r`, path: String.raw`C:\Roaming\r\A\O`, taskCount: 3, lastActivityMs: 9, email: 'e@x.io' },
+      { ...base, root: String.raw`C:\LocalCache\r`, path: String.raw`C:\LocalCache\r\A\O`, lastActivityMs: 5, leftover: true }
     ])
     expect(out).toEqual([
       {
         ...base,
-        root: 'C:\LocalCache\r',
-        path: 'C:\LocalCache\r\A\O',
+        root: String.raw`C:\LocalCache\r`,
+        path: String.raw`C:\LocalCache\r\A\O`,
         taskCount: 3,
         lastActivityMs: 9,
         email: 'e@x.io',

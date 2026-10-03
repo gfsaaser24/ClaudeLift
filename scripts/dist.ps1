@@ -39,7 +39,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "dist: build:mcp (MCP server bundle) failed (exit $LASTEXITCODE)" }
   npx electron-vite build
   if ($LASTEXITCODE -ne 0) { throw "dist: electron-vite build failed (exit $LASTEXITCODE)" }
-  npx electron-builder --win --config electron.builder.yml --config.extraMetadata.version=0.5.0
+  npx electron-builder --win --config electron.builder.yml
   if ($LASTEXITCODE -ne 0) { throw "dist: electron-builder failed (exit $LASTEXITCODE)" }
 } finally {
   Pop-Location

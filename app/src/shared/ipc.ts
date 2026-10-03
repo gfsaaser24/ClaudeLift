@@ -673,7 +673,13 @@ export const WorkspaceInfoSchema = z.object({
   /** The account Claude Desktop is signed in to now (config.json lastKnownAccountUuid). */
   signedInNow: z.boolean().default(false),
   /** Org folder that is not one of the account's orgs (left over from switching accounts). */
-  leftover: z.boolean().default(false)
+  leftover: z.boolean().default(false),
+  /**
+   * New-layout account (projects and threads live in the cloud): no
+   * spaces.json, no tasks, only remote-session-spaces.json. Importing
+   * tasks/spaces here creates no projects — use the push (card D).
+   */
+  newLayout: z.boolean().default(false)
 })
 
 export type WorkspaceInfo = z.infer<typeof WorkspaceInfoSchema>
@@ -726,7 +732,13 @@ export const PullRunIdSchema = z.string().regex(/^[A-Za-z0-9_-]{4,64}$/, 'not a 
 
 export const ClaudeConsolePullRequestSchema = z.object({
   runId: PullRunIdSchema,
-  chats: PullChatsModeSchema
+  chats: PullChatsModeSchema,
+  /**
+   * console (default) = type into the claude.ai DevTools window;
+   * debugger = run the script in Claude Desktop's claude.ai page through its
+   * Main Process Debugger (for DevTools windows with no or a blank title).
+   */
+  via: z.enum(['console', 'debugger']).optional()
 })
 
 export type ClaudeConsolePullRequest = z.infer<typeof ClaudeConsolePullRequestSchema>
@@ -812,6 +824,200 @@ export const ClaudeAiPullProgressSchema = z.object({
 export type ClaudeAiPullProgress = z.infer<typeof ClaudeAiPullProgressSchema>
 
 // ---------------------------------------------------------------------------
+// Push: rebuild projects in a new-layout account (docs/NEW-LAYOUT-SPEC.md)
+// ---------------------------------------------------------------------------
+
+/** How a plan project came to be (engine `plan-push`). */
+export const PushProjectKindSchema = z.enum([
+  'claude-project',
+  'cowork-space',
+  'cowork-history',
+  'chat-history',
+  'account-memory'
+])
+export type PushProjectKind = z.infer<typeof PushProjectKindSchema>
+
+export const PushCountsSchema = z.looseObject({
+  docs: z.number().int().default(0),
+  files: z.number().int().default(0),
+  chats: z.number().int().default(0),
+  cowork: z.number().int().default(0),
+  memory: z.number().int().default(0),
+  bytes: z.number().default(0),
+  keys_removed: z.number().int().default(0)
+})
+export type PushCounts = z.infer<typeof PushCountsSchema>
+
+/** One project of the plan file as the engine writes it (main process only). */
+export const PushPlanProjectSchema = z.object({
+  key: z.string().min(1),
+  name: z.string().min(1),
+  source_name: z.string().nullish(),
+  org: z.string().nullish(),
+  kind: PushProjectKindSchema.or(z.string()),
+  instructions: z.string().default(''),
+  library: z.array(
+    z.object({
+      path: z.string().min(1),
+      file: z.string().min(1),
+      size: z.number().int().nonnegative(),
+      mime: z.string().min(1)
+    })
+  ),
+  memory: z.array(
+    z.object({
+      path: z.string().regex(/^\//, 'memory paths start with /'),
+      content: z.string(),
+      redacted: z.number().int().default(0)
+    })
+  ),
+  counts: PushCountsSchema,
+  warnings: z.array(z.string()).default([]),
+  empty: z.boolean().default(false)
+})
+export type PushPlanProject = z.infer<typeof PushPlanProjectSchema>
+
+export const PushPlanSchema = z.looseObject({
+  plan_version: z.literal(1),
+  source: z.string(),
+  projects: z.array(PushPlanProjectSchema),
+  skipped: z.array(z.looseObject({ name: z.string().nullish() })).default([])
+})
+export type PushPlan = z.infer<typeof PushPlanSchema>
+
+/** `push:plan` request → engine `plan-push`. Main picks the plan file under settings.outputDir. */
+export const PushPlanRequestSchema = z.object({
+  /** A converted claude.ai account folder (has projects/, account/, conversations/). */
+  source: z.string().min(1),
+  /** Optional folder of Cowork task bundles (an `export` output). */
+  coworkBundles: z.string().min(1).optional(),
+  includeChats: z.boolean(),
+  includeUnfiledChats: z.boolean(),
+  includeAccountMemory: z.boolean(),
+  /** Only projects of these organizations (names); empty = all. */
+  orgs: z.array(z.string().min(1)).default([])
+})
+export type PushPlanRequest = z.infer<typeof PushPlanRequestSchema>
+
+/** What the renderer sees of a plan project (no file paths, no memory text). */
+export const PushPlanItemSchema = z.object({
+  key: z.string(),
+  name: z.string(),
+  org: z.string().nullable(),
+  kind: z.string(),
+  counts: PushCountsSchema,
+  instructionsChars: z.number().int(),
+  warnings: z.array(z.string())
+})
+export type PushPlanItem = z.infer<typeof PushPlanItemSchema>
+
+export const PushPlanSummarySchema = z.object({
+  planFile: z.string(),
+  source: z.string(),
+  projects: z.array(PushPlanItemSchema),
+  /** Names of empty projects left out of the plan. */
+  skipped: z.array(z.string())
+})
+export type PushPlanSummary = z.infer<typeof PushPlanSummarySchema>
+
+/** Where the claude.ai calls run: ClaudeLift's own sign-in, or Claude Desktop's page via its Main Process Debugger. */
+export const PushExecutorSchema = z.enum(['claudeai', 'desktop'])
+export type PushExecutor = z.infer<typeof PushExecutorSchema>
+
+export const PushAccountRequestSchema = z.object({ executor: PushExecutorSchema })
+export type PushAccountRequest = z.infer<typeof PushAccountRequestSchema>
+
+/** The account the executor's claude.ai page is signed in to (read-only check). */
+export const PushAccountSchema = z.object({
+  email: z.string().nullable(),
+  orgUuid: z.string(),
+  orgName: z.string().nullable(),
+  /** Live (not archived) new-layout projects in that org. */
+  projectNames: z.array(z.string())
+})
+export type PushAccount = z.infer<typeof PushAccountSchema>
+
+/** `push:desktopStatus`: is Claude Desktop's Main Process Debugger open on 127.0.0.1:9229? */
+export const PushDesktopStatusSchema = z.object({
+  available: z.boolean(),
+  detail: z.string()
+})
+export type PushDesktopStatus = z.infer<typeof PushDesktopStatusSchema>
+
+export const PushRunRequestSchema = z.object({
+  planFile: z.string().min(1),
+  /** Plan project keys to run. */
+  keys: z.array(z.string().min(1)).min(1),
+  executor: PushExecutorSchema,
+  dryRun: z.boolean(),
+  /** The email the user saw and confirmed; the run stops when the page is signed in to another account. */
+  expectEmail: z.string().nullable().optional()
+})
+export type PushRunRequest = z.infer<typeof PushRunRequestSchema>
+
+export const PushActionSchema = z.enum(['create', 'skip', 'resume'])
+export type PushAction = z.infer<typeof PushActionSchema>
+
+export const PushFailureSchema = z.object({
+  path: z.string(),
+  step: z.string(),
+  status: z.number().int().nullable(),
+  error: z.string().nullable()
+})
+export type PushFailure = z.infer<typeof PushFailureSchema>
+
+export const PushProjectResultSchema = z.object({
+  key: z.string(),
+  name: z.string(),
+  action: PushActionSchema,
+  /** Why it was skipped (dry run and real run). */
+  reason: z.string().nullable(),
+  chan: z.string().nullable(),
+  url: z.string().nullable(),
+  instructions: z.enum(['set', 'kept', 'none', 'failed']).nullable(),
+  library: z.object({
+    planned: z.number().int(),
+    written: z.number().int(),
+    existing: z.number().int(),
+    failed: z.array(PushFailureSchema)
+  }),
+  memory: z.object({
+    planned: z.number().int(),
+    written: z.number().int(),
+    existing: z.number().int(),
+    failed: z.array(PushFailureSchema)
+  }),
+  verify: z.object({ libraryFiles: z.number().int(), memoryFiles: z.number().int() }).nullable(),
+  complete: z.boolean(),
+  error: z.string().nullable()
+})
+export type PushProjectResult = z.infer<typeof PushProjectResultSchema>
+
+export const PushRunResultSchema = z.object({
+  dryRun: z.boolean(),
+  account: PushAccountSchema,
+  receiptFile: z.string(),
+  projects: z.array(PushProjectResultSchema),
+  cancelled: z.boolean()
+})
+export type PushRunResult = z.infer<typeof PushRunResultSchema>
+
+/** `evt:pushProgress` payload. */
+export const PushProgressSchema = z.object({
+  key: z.string().nullable(),
+  name: z.string().nullable(),
+  /** 1-based position of the project in this run, and the run's project count. */
+  index: z.number().int(),
+  total: z.number().int(),
+  phase: z.enum(['account', 'checking', 'create', 'instructions', 'library', 'memory', 'verify', 'done']),
+  /** Items done / planned within the phase (library files, memory notes). */
+  done: z.number().int(),
+  of: z.number().int(),
+  line: z.string().nullable()
+})
+export type PushProgress = z.infer<typeof PushProgressSchema>
+
+// ---------------------------------------------------------------------------
 // Channel names
 // ---------------------------------------------------------------------------
 
@@ -856,7 +1062,12 @@ export const INVOKE_CHANNELS = {
   claudeAiSignIn: 'claudeAi:signIn',
   claudeAiSignOut: 'claudeAi:signOut',
   claudeAiRunPull: 'claudeAi:runPull',
-  claudeAiCancel: 'claudeAi:cancel'
+  claudeAiCancel: 'claudeAi:cancel',
+  pushPlan: 'push:plan',
+  pushAccount: 'push:account',
+  pushDesktopStatus: 'push:desktopStatus',
+  pushRun: 'push:run',
+  pushCancel: 'push:cancel'
 } as const
 
 /** Contract map for the preload's channel-literal duplication (`satisfies`). */
@@ -873,7 +1084,8 @@ export const EVENT_CHANNELS = {
   importAllProgress: 'evt:importAllProgress',
   claudeConsoleProgress: 'evt:claudeConsoleProgress',
   claudeAiStatus: 'evt:claudeAiStatus',
-  claudeAiPullProgress: 'evt:claudeAiPullProgress'
+  claudeAiPullProgress: 'evt:claudeAiPullProgress',
+  pushProgress: 'evt:pushProgress'
 } as const
 
 export type EventChannelMap = typeof EVENT_CHANNELS
@@ -943,6 +1155,16 @@ export interface CoworkExporterApi {
   claudeAiRunPull(req: ClaudeAiPullRequest): Promise<ClaudeAiPullResult>
   /** Cancel the running claude.ai pull (no-op when idle). */
   claudeAiCancel(): Promise<void>
+  /** Engine `plan-push`: what would be rebuilt in a new-layout account. */
+  pushPlan(req: PushPlanRequest): Promise<PushPlanSummary>
+  /** Read-only: which account the executor's claude.ai page is signed in to. */
+  pushAccount(req: PushAccountRequest): Promise<PushAccount>
+  /** Read-only: is Claude Desktop's Main Process Debugger open? */
+  pushDesktopStatus(): Promise<PushDesktopStatus>
+  /** Rebuild the chosen plan projects (dry run: GET calls only). Progress on evt:pushProgress. */
+  pushRun(req: PushRunRequest): Promise<PushRunResult>
+  /** Stop the running push after the current call (no-op when idle). */
+  pushCancel(): Promise<void>
 
   onTasksChanged(cb: () => void): Unsubscribe
   offTasksChanged(cb?: () => void): void
@@ -962,6 +1184,8 @@ export interface CoworkExporterApi {
   offClaudeAiStatus(cb?: (status: ClaudeAiSessionStatus) => void): void
   onClaudeAiPullProgress(cb: (event: ClaudeAiPullProgress) => void): Unsubscribe
   offClaudeAiPullProgress(cb?: (event: ClaudeAiPullProgress) => void): void
+  onPushProgress(cb: (event: PushProgress) => void): Unsubscribe
+  offPushProgress(cb?: (event: PushProgress) => void): void
 }
 
 // ---------------------------------------------------------------------------

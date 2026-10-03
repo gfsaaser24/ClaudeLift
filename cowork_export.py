@@ -119,6 +119,116 @@ CODE_ROOT = HOME / ".claude" / "projects"
 DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
+
+# Credentials that must never be written to another account. The claude.ai
+# memory store rejects notes that contain them, and a key copied into a new
+# project would leak it a second time. One pattern for every writer.
+# Prefixes need a non-alphanumeric character before them, so words such as
+# "task-management-and-planning" are not taken for an "sk-" key.
+_NB = r"(?<![A-Za-z0-9])"
+SECRET_RE = re.compile(
+    # Env-style lines with an UPPERCASE name: keep the name, blank the value.
+    r"(?P<envk>^[ \t]*(?:export[ \t]+)?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*[ \t]*[=:][ \t]*[\"']?)"
+    r"(?P<envv>[^\s\"']{8,})"
+    # Credentials in URLs (scheme://user:password@host): blank the password.
+    r"|(?P<urlk>://[^\s/:@]+:)(?P<urlv>[^\s/@]+)(?=@)"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY[A-Z ]*-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY[A-Z ]*-----"
+    rf"|{_NB}AIza[0-9A-Za-z_\-]{{35}}"
+    rf"|{_NB}sk-ant-[0-9A-Za-z_\-]{{20,}}"
+    rf"|{_NB}sk-[A-Za-z0-9_\-]{{20,}}"
+    rf"|{_NB}(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{{20,}}"
+    rf"|{_NB}gh[pousr]_[A-Za-z0-9]{{30,}}"
+    rf"|{_NB}github_pat_[A-Za-z0-9_]{{30,}}"
+    rf"|{_NB}glpat-[A-Za-z0-9_\-]{{20,}}"
+    rf"|{_NB}ntn_[A-Za-z0-9]{{30,}}"
+    rf"|{_NB}secret_[A-Za-z0-9]{{30,}}"
+    rf"|{_NB}xox[abprs]-[A-Za-z0-9\-]{{10,}}"
+    rf"|{_NB}xapp-[A-Za-z0-9\-]{{10,}}"
+    rf"|{_NB}(?:AKIA|ASIA)[0-9A-Z]{{16}}"
+    rf"|{_NB}GOCSPX-[A-Za-z0-9_\-]{{20,}}"
+    rf"|{_NB}hf_[A-Za-z0-9]{{30,}}"
+    rf"|{_NB}npm_[A-Za-z0-9]{{36,}}"
+    rf"|{_NB}SG\.[A-Za-z0-9_\-]{{16,}}\.[A-Za-z0-9_\-]{{20,}}"
+    rf"|{_NB}eyJ[A-Za-z0-9_\-]{{20,}}\.[A-Za-z0-9_\-]{{10,}}\.[A-Za-z0-9_\-]{{10,}}",
+    re.MULTILINE,
+)
+SECRET_PLACEHOLDER = "[API key removed by ClaudeLift]"
+TEXT_SNIFF_BYTES = 8192
+
+
+def _blank_match(m: re.Match[str]) -> str:
+    if m.group("envv") is not None:
+        return m.group("envk") + SECRET_PLACEHOLDER
+    if m.group("urlv") is not None:
+        return m.group("urlk") + SECRET_PLACEHOLDER
+    return SECRET_PLACEHOLDER
+
+
+def blank_secrets(text: str) -> tuple[str, int]:
+    """Replace every credential in ``text`` with a placeholder. Returns the new
+    text and how many were removed. Never log the matches."""
+    return SECRET_RE.subn(_blank_match, text)
+
+
+def sniff_text(p: Path) -> tuple[str, str, str] | None:
+    """Read ``p`` as text for a credential scan: (text, encoding, errors), or
+    None when it is binary (a NUL byte in the first 8 KB). UTF-16 needs its
+    BOM; other text that is not valid UTF-8 is read with surrogateescape so
+    it can be written back byte for byte. Raises UnicodeDecodeError when the
+    text cannot be read at all (the caller leaves the file out) and OSError."""
+    with p.open("rb") as fh:
+        head = fh.read(TEXT_SNIFF_BYTES)
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return p.read_bytes().decode("utf-16"), "utf-16", "strict"
+    if b"\x00" in head:
+        return None
+    data = p.read_bytes()
+    try:
+        return data.decode("utf-8"), "utf-8", "strict"
+    except UnicodeDecodeError:
+        return data.decode("utf-8", "surrogateescape"), "utf-8", "surrogateescape"
+
+
+def write_sniffed(dest: Path, text: str, encoding: str, errors: str) -> None:
+    """Write text read by :func:`sniff_text` back in the same encoding."""
+    dest.write_bytes(text.encode(encoding, errors))
+
+
+def _stage_blanked_tree(src: Path, staging: Path) -> tuple[Path, int, list[str]]:
+    """When any text file under ``src`` holds a credential (or cannot be
+    checked), copy the tree to ``staging`` with credentials blanked and
+    unreadable files left out; return (staging, count, warnings). Else
+    (src, 0, []) unchanged."""
+    files = list_dir_files(src)
+    hits: dict[Path, tuple[str, str, str]] = {}
+    left_out: set[Path] = set()
+    warnings: list[str] = []
+    total = 0
+    for f in files:
+        try:
+            sniffed = sniff_text(f)
+        except (OSError, UnicodeDecodeError) as e:
+            left_out.add(f)
+            warnings.append(f"{f.name} left out: it cannot be checked for credentials ({e.__class__.__name__})")
+            continue
+        if sniffed is None:
+            continue
+        new, n = blank_secrets(sniffed[0])
+        if n:
+            hits[f] = (new, sniffed[1], sniffed[2])
+            total += n
+    if not hits and not left_out:
+        return src, 0, []
+    for f in files:
+        if f in left_out:
+            continue
+        dest = staging / f.relative_to(src)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if f in hits:
+            write_sniffed(dest, *hits[f])
+        else:
+            shutil.copy2(f, dest)
+    return staging, total, warnings
 BUNDLE_VERSION = 1
 TOOL_VERSION = "0.6.0-desktop"
 SEED_TEXT_TRUNCATE = 500
@@ -2593,9 +2703,17 @@ def upsert_space(
                        f"will not sync to the cloud project: {', '.join(big[:5])}")
         if n > SPACE_MEMORY_MAX_FILES:
             log.append(f"space: warn: only the first {SPACE_MEMORY_MAX_FILES} memory files sync to the cloud project")
-        if not dry_run:
-            c, k = _copy_tree_no_clobber(memory_src, mem_dst)
-            log.append(f"space: memory copied={c} unchanged={k}")
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="claudelift-memblank-") as tmp:
+            # The desktop app syncs space memory to the cloud project, so a
+            # key in a note would reach the new account: blank them first.
+            mem_from, removed, warns = _stage_blanked_tree(memory_src, Path(tmp))
+            if removed:
+                log.append(f"space: {removed} credential(s) removed from memory notes")
+            log.extend(f"space: warn: memory note {w}" for w in warns)
+            if not dry_run:
+                c, k = _copy_tree_no_clobber(mem_from, mem_dst)
+                log.append(f"space: memory copied={c} unchanged={k}")
 
     if not dry_run:
         if created:
@@ -3487,6 +3605,31 @@ def cmd_convert_claudeai(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan_push(args: argparse.Namespace) -> int:
+    """Write a push plan for a new-layout account (projects live in the cloud,
+    docs/NEW-LAYOUT-SPEC.md). Reads only; uploads nothing."""
+    import claudeai_export as cae
+    source = Path(args.source).expanduser()
+    if not (source / "projects").is_dir() and not (source / "account").is_dir():
+        print(f"error: {source} is not a converted folder (no projects/ or account/; run convert-claudeai first)",
+              file=sys.stderr)
+        return 2
+    bundles = Path(args.cowork_bundles).expanduser() if args.cowork_bundles else None
+    if bundles is not None and not bundles.is_dir():
+        print(f"error: --cowork-bundles {bundles} is not a folder", file=sys.stderr)
+        return 2
+    names = None if not args.projects or args.projects.strip().lower() == "all" else \
+        [n.strip() for n in args.projects.split(",") if n.strip()]
+    out = Path(args.out).expanduser()
+    plan = cae.build_push_plan(
+        source, out, cowork_bundles=bundles, include_chats=not args.no_chats,
+        include_unfiled_chats=args.include_unfiled_chats, include_account_memory=not args.no_account_memory,
+        orgs=args.org, projects=names, include_empty=args.include_empty,
+    )
+    print(json.dumps({"event": "done", "plan": str(out.resolve()), **plan["totals"]}, ensure_ascii=False), flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cowork_export",
@@ -3737,6 +3880,31 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--limit", type=int, default=None, help="at most N chats (newest first)")
     pc.add_argument("--progress-json", action="store_true", help="emit NDJSON progress events on stdout")
     pc.set_defaults(func=cmd_convert_claudeai)
+
+    pp = sub.add_parser(
+        "plan-push",
+        help="plan the projects to create in a new-layout account (reads only)",
+        description=(
+            "Read a converted folder (convert-claudeai output) and write a JSON "
+            "plan: one project per claude.ai project / Cowork space, with its "
+            "instructions, Library files (docs, files/, chats/, cowork/) and "
+            "memory notes. Credentials are blanked. The ClaudeLift app runs the "
+            "plan against claude.ai; this command uploads nothing."
+        ),
+    )
+    pp.add_argument("--source", required=True, metavar="DIR", help="converted folder (has projects/, account/)")
+    pp.add_argument("--cowork-bundles", default=None, metavar="DIR",
+                    help="folder of exported Cowork task bundles; each goes to its space's project")
+    pp.add_argument("--no-chats", action="store_true", help="leave out chat transcripts linked to projects")
+    pp.add_argument("--include-unfiled-chats", action="store_true",
+                    help="put chats that were in no project into a 'Chat history (imported)' project")
+    pp.add_argument("--no-account-memory", action="store_true",
+                    help="leave out the 'Account memory (imported)' project")
+    pp.add_argument("--org", action="append", metavar="NAME", help="only projects of this organization (repeatable)")
+    pp.add_argument("--projects", default="all", metavar="all|NAME,NAME", help="which projects (default: all)")
+    pp.add_argument("--include-empty", action="store_true", help="keep projects with nothing in them")
+    pp.add_argument("--out", required=True, metavar="FILE", help="plan JSON to write")
+    pp.set_defaults(func=cmd_plan_push)
 
     return p
 
