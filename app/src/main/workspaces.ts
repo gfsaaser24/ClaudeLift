@@ -193,6 +193,7 @@ async function describeWorkspace(
   // An empty folder whose org belongs to another (cached) account.
   const orgOwnedElsewhere =
     files.length === 0 &&
+    !(cached?.orgIds.includes(orgId) ?? false) &&
     [...accounts.entries()].some(([id, a]) => id !== accountId && a.orgIds.includes(orgId))
   return {
     path,

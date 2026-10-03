@@ -1,6 +1,6 @@
 # Spec: moving work into a new-layout Claude account
 
-Status: research done and proven on one project (2026-10-03). Build not started.
+Status: research done and proven on one project (2026-10-03). Build done (section 6, steps 1–6): engine `plan-push`, app push (`app/src/main/project-push.ts`, `desktop-inspector.ts`, `register-push.ts`), Migrate card D, new-layout guard, DevTools fallback. Live runs: see section 9.
 Branch `feat/claudeai-account-migration`, PR #1 (gfsaaser24/ClaudeLift).
 
 ## 1. Why this exists
@@ -16,18 +16,15 @@ the claude.ai API instead, the same calls the Claude Desktop app makes.
 
 | Item | State |
 |---|---|
-| PR #1 | 3 commits (`736d82e`, `cff9243`, `6419a26`). All 16 review comments fixed and answered. 86 app tests, `tests/engine_selftest.py`, `tests/claudeai_selftest.py` pass. |
-| Source account | gabe@detailinggrowth.com, account `5add762c-4a85-406e-a688-ead6f4200a00`, org "Gabe F" `9c1f5959-c753-43b1-8d65-dd033507472f` (old layout). |
-| Target account | gabe@makershelpdesk.com, account `5bf3f70f-a50b-4d20-b413-dc90b7a9cfca`, org `c7958373-168b-4bb6-865a-a3ac5b60c76d` (new layout). Cowork folder `…\local-agent-mode-sessions\5bf3f70f…\c7958373…` (only `rpm/`, `scheduled-tasks.json`, `remote-session-spaces.json`). Leftover folder `5add762c…\c7958373…` is NOT a target. |
-| Saved data (source) | `C:\Users\gabef\Documents\CoworkExports\` — `claude-account\` (export + live pull `claude-account-pulls\claudelift-pull-20261003-011730-9z7ngn.json` converted: 80 projects, 2,062 chats, account memory, `account\…\chats-index.json` with chat→project links, skills, plugin zips, REINSTALL.md), `account-move\` (94 Cowork task bundles of the Max org), `held-back\` (GRIT-DG bundles/projects, not moving). |
-| Proven in target | **Copywriting with Faris** `chan_017S9M6tFhc2ya6PFJM5CvXK`: instructions, 7 docs at Library top level, 153 chat transcripts in `chats/`, 4 memory notes. A real thread read the docs, chats and memory and wrote new memory. |
-| Test projects to delete (by the user, in the app) | "Claude Lift Test" `chan_011bAcnLakRCBDftFpciYHZb`, "ClaudeLift Import Test" `chan_018sSLnehhtS6Q5iKt78wssZ` (also holds test memory notes). |
-| Security follow-up | A Google Gemini API key sits in the old project memory of "Copywriting with Faris" (and so in the export, the pull files and the converted folders). The user should rotate it. ClaudeLift blanks keys before writing memory (the target memory store rejects them anyway). |
+| Source | An old-layout account (Cowork spaces + tasks) with classic claude.ai projects, saved with the live pull + data export and converted by `convert-claudeai` (projects, chats with their project links, account memory, skills, plugin zips), plus Cowork task bundles from `export`. |
+| Target | A new-layout account. Its Cowork folder `…\local-agent-mode-sessions\<account>\<org>` holds only `rpm/`, `scheduled-tasks.json` and `remote-session-spaces.json`. A folder `<old account>\<new org>` can appear while switching accounts; it is not a target. |
+| Proven in a target | One project rebuilt by hand with the reference script: instructions, 7 docs at Library top level, 153 chat transcripts in `chats/`, 4 memory notes. A real thread read the docs, chats and memory and wrote new memory. |
+| Security | Old project memory and chats can hold API keys. ClaudeLift blanks credentials before writing memory and in text files before upload (the memory store rejects them anyway). Rotate any key you find in old data. |
 | Reference scripts | `research/new-layout/` — `cdp-main.mjs`, `inpage.py`, `push_project.py` (proven flow, dry run, skip-by-name, key blanking, padded ids, batch retry), `install-recorder.main.js`, `dump-recorder.main.js`. |
 
 ## 3. The new layout (observed live, Claude Desktop 2.19675.0.0)
 
-- **Project = channel** `chan_…`, route `claude.ai/epitaxy/project/<chan>`. Each has an agent `cagt_…`, an overview session `cse_…`, a memory store `memstore_…`, a Library (file storage) and a config.
+- **Project = channel** `chan_…`, web link `https://claude.ai/code/project/<chan>` (Claude Desktop's internal route is `claude.ai/epitaxy/project/<chan>`). Each has an agent `cagt_…`, an overview session `cse_…`, a memory store `memstore_…`, a Library (file storage) and a config.
 - **Thread = channel message** `cmsg_…` bound to a cloud session (`/v1/code/sessions/session_…`; `cse_…` and `session_…` share the id body). Threads run in the cloud. A local folder is only a live link through Claude Desktop ("remote control"), stored in `%APPDATA%\Claude\remote-control-state.json` (per `org:account` identity) and `<acct>\<org>\remote-session-spaces.json`; project folders added in settings → env become machine environments (`/v1/code/channels/{id}/remote-control-preapproval`).
 - **Old chats cannot become real threads.** They go into the project Library as transcripts; a thread reads them from `/mnt/project-files/`.
 - **Classic claude.ai projects** (`/api/organizations/{org}/projects`) are empty in the new account; new projects are not classic projects.
@@ -79,14 +76,21 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 
 1. **Engine: `plan-push` command** (`cowork_export.py` + `claudeai_export.py`). Input: a converted folder (`claude-account\…`), optional `--cowork-bundles <account-move>`, `--include-chats`, `--include-unfiled-chats`, `--projects <names|all>`. Output: one JSON plan per project (name, instructions, Library entries with source file paths — not inlined bytes, memory notes already key-blanked, warnings like "instructions truncated", "N keys removed"). Move the key-blanking regex into a shared helper; reuse it for space memory on the old-layout import too. Self-test in `tests/claudeai_selftest.py` (plan shape, truncation, key blanking, chat mapping, Cowork-task mapping).
 2. **App: `app/src/main/project-push.ts`.** Executes a plan against a claude.ai page through an executor interface `{ runInPage(js): Promise<unknown> }` with two implementations: the `persist:claudeai` hidden window (default) and the Claude Desktop main-process inspector (optional, detected on `127.0.0.1:9229`). Per project: list channels (skip by name), create, PATCH config, upload each file streaming from disk (one `executeJavaScript` per file or small group — never one giant payload), `files:write` in batches of 25 with per-file retry, memory writes, read-back verify (`files:list` limit 500 with cursor, memory list). Emit progress events; write a receipt JSON (`<outputDir>\push-receipts\<timestamp>.json`) with every created id, so a run can be resumed and audited. Never delete anything.
-3. **App UI: Migrate card D "Rebuild projects in the new account".** Shows which account the session is signed in to (email from `/api/account_profile` or the bootstrap), the project list from the plan with kind/size/chat count and checkboxes, options (include chats, include Cowork history, include unfiled chats, dry run on by default), per-project progress, results table, link to open each new project (`https://claude.ai/epitaxy/project/<chan>`).
+3. **App UI: Migrate card D "Rebuild projects in the new account".** Shows which account the session is signed in to (email from `/api/account_profile` or the bootstrap), the project list from the plan with kind/size/chat count and checkboxes, options (include chats, include Cowork history, include unfiled chats, dry run on by default), per-project progress, results table, link to open each new project (`https://claude.ai/code/project/<chan>`).
 4. **Guard the old-layout import.** Detect a new-layout target (no `spaces.json`, account created after the change — simplest: ask, or detect channels via the API) and steer the user to card D instead of writing `spaces.json`.
 5. **DevTools route fix:** when no titled claude.ai DevTools window exists, offer the main-process-debugger route instead of failing.
 6. Docs: update `docs/CLAUDEAI.md` and README; tests for every new helper; keep all existing tests green.
 
+### 6.1 As built
+
+- Engine: `cowork_export.py plan-push --source <converted> [--cowork-bundles DIR] [--no-chats] [--include-unfiled-chats] [--no-account-memory] [--org NAME …] [--projects all|"A,B"] [--include-empty] --out plan.json`. One shared `blank_secrets()` (also used by the old-layout space-memory import). Text files with a credential get a blanked copy in `<plan dir>\push-staging\`. Cowork tasks map to the project whose `_pull…cowork_bound_device.local_space_id` matches the bundle's `source_space_id` (fallback: same name). A Cowork space whose name collides becomes "<name> (Cowork)".
+- App: plans live in `<outputDir>\push-plans\` (push:run reads only from there); receipts in `<outputDir>\push-receipts\` (`dry-run-*.json`, `push-*.json`). Resume = a live channel with the plan's name whose id a non-dry-run receipt recorded for that key and marked incomplete; only missing Library paths are added (case-insensitive), instructions are set only when empty, memory uses `not_exists`.
+- Executors: `persist:claudeai` hidden window (`openPushPage`), Claude Desktop main process (`openDesktopExecutor`; only a loopback inspector whose `process.execPath` is `claude.exe`, never ClaudeLift itself).
+- Guard: `WorkspaceInfo.newLayout` = no `spaces.json`, no tasks, `remote-session-spaces.json` present.
+
 ## 7. Rules that must hold
 
-- Dry run first, then the real run. Skip projects whose name already exists (do not duplicate Faris). Never delete or overwrite (memory precondition `not_exists`).
+- Dry run first, then the real run. Skip projects whose name already exists (never duplicate a project). Never delete or overwrite (memory precondition `not_exists`).
 - Blank credentials before any upload to memory; report how many were removed (never print the key).
 - `files:list` limit ≤ 500; tagged ids padded to 22 chars; batch failure → per-file retry.
 - Only GET calls until the user approves a write run. Writes go only to the account the user picked; show its email before writing.
@@ -97,21 +101,11 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 - Plugin and skill upload calls (record them with the recorder while the user uploads one zip in Customize → Plugins / Skills).
 - Whether `/v1/code/project-conversions` can convert a classic project server-side (would replace parts of step 2).
 - Account-level memory location in the new layout (the "Account memory (imported)" project is the fallback).
-- Rate limits for bulk uploads (Faris: 160 uploads plus 160 re-uploads in one session, no rate-limit errors seen; not measured further).
+- Rate limits for bulk uploads (the proven project: 160 uploads plus 160 re-uploads in one session, no rate-limit errors seen; not measured further).
 
 ## 9. Acceptance
 
 - Dry run lists all chosen projects with correct counts and "skip" for existing names.
-- Real run for 3 sample projects (one docs-only, one with PDFs — "tax" or "Alex", one Cowork space like "DG 2026"): each opens in Claude Desktop with instructions, Library, memory; a new thread can read a Library file and a memory note.
+- Real run for 3 sample projects (one docs-only, one with PDFs, one former Cowork space): each opens in Claude Desktop with instructions, Library, memory; a new thread can read a Library file and a memory note.
 - Receipt JSON lists every created channel/file/memory id; re-running skips everything already done.
 - `npm run typecheck`, `npm test`, both engine self-tests pass; PR updated.
-
-## 10. Hand-off prompt (paste after compacting)
-
-> Continue ClaudeLift in `C:\code\claudelift`, branch `feat/claudeai-account-migration` (PR #1). Read `docs/NEW-LAYOUT-SPEC.md` fully first; it is the source of truth for the new Claude account layout, the claude.ai API calls, what is proven, and the build plan. Reference scripts are in `research/new-layout/`.
-> Do this, in order, reporting after each step:
-> 1. Implement section 6 step 1 (engine `plan-push` + shared key-blanking + self-tests).
-> 2. Implement section 6 steps 2–3 (app executor + card D), default executor = the `persist:claudeai` hidden window; the main-process-debugger executor is optional/detected.
-> 3. Step 4 (guard old-layout import) and step 5 (DevTools fallback), docs, tests; commit and push to PR #1 with the attribution lines.
-> 4. Then ask the user before any write run. Do a dry run of all Max-org projects (`C:\Users\gabef\Documents\CoworkExports\claude-account`) against the target gabe@makershelpdesk.com; then, on approval, a real run for 3 sample projects (section 9), verify, then the rest.
-> Constraints: section 7 rules. Never print or upload credentials (blank them). Skip existing names ("Copywriting with Faris" already exists). Do not delete anything; the user deletes the two test projects. Talk to the user in short, simple sentences (ASD-STE100), no jargon.
