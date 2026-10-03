@@ -39,7 +39,8 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 | Get project | `GET /v1/code/channels/{chan}` | `{channel:{id,name,agent_id,context_sources,memory_enabled,default_skill_ids,default_plugin_ids,…}}` |
 | Create project | `POST /v1/code/channels` | `{name, visibility:"private", context_sources:[], icon?, color?}`. App adds `context_sources:[{kind:"local_folder", name}]` when a folder is picked (files then live under `<name>/` in the Library). |
 | Instructions | `PATCH /v1/code/channels/{chan}/config` | `{system_prompt_addendum:"…"}`, UI limit 16,000 chars. Config also holds `default_skill_ids`, `default_plugin_ids`, `default_source_urls`, `mcp_servers`, `memory_enabled`, `default_model`. |
-| Upload a file | `POST /api/{org}/upload?store_as_is=true` | multipart field `file`. Response `{file_uuid,…}`. |
+| Upload a Library file (use this) | `POST /v1/code/channels/{chan}/files:beginUpload` → `POST /v1/filestore/fs/createFile` | `beginUpload {size_bytes}` → `{filestore_jwt, upload_path, filesystem_id, max_bytes: 503316480, expires_at (+10 min)}`. Then multipart `params` (JSON blob `{filesystem_id, path: upload_path, media_type}`) + `file`, header `authorization: Bearer <filestore_jwt>` (+ `x-organization-uuid`). Then `files:write {files:[{staged_upload_path: upload_path, path}]}`. Up to 480 MB per file; not counted against the chat upload limit. |
+| Chat attachment upload (do NOT use for the Library) | `POST /api/{org}/upload?store_as_is=true` | multipart `file` → `{file_uuid}`; `files:write` also accepts `source_file_id` (`file_01…`). Refuses > ~30 MB (413) and stops after ~20,000 files a day (429 `file_limit_exceeded`). |
 | File id for Library | — | `file_01` + base58(16 uuid bytes), alphabet `123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`, **left-padded with `1` to 22 chars**. Same scheme as `user_01…` for accounts. |
 | Put files in Library | `POST /v1/code/channels/{chan}/files:write` | `{files:[{path, source_file_id}]}`. Batches of 25 work; one bad id rejects the whole batch (retry one by one). A path that already exists comes back without `entry`. |
 | List Library | `POST /v1/code/channels/{chan}/files:list` | `{recursive:true, limit:500}`; **limit must be 1–500** (501 → 400 "Request validation failed"); `cursor` in the response for more. Also `GET …/files/usage`. |
@@ -48,6 +49,9 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 | New thread | `POST /v1/code/channels/{chan}/messages` | `{body, client_message_id:<uuid>, attachments?:[{file_id:"file_01…", filename, mime_type}]}` → `{message_id, thread_root_id}` |
 | Threads / timeline | `GET …/threads`, `GET …/timeline?limit=200[&thread_roots_only=true]` | |
 | Session events | `GET /v1/code/sessions/session_…/events?limit=500&sort_order=asc` | shows tool calls (e.g. reads of `/mnt/project-files/…`). |
+| Project folder (Library "Add folder") | `PATCH /v1/code/channels/{chan}` | `{context_sources:[{kind:"local_folder", name}]}` (send the full list; existing entries come back with `path:""`, `url:""`), then upload each file and `files:write` it at `<name>/<rel>`. |
+| Live folder link (settings → environment → Add folder) | `POST /v1/code/channels/{chan}/remote-control-preapproval` | `{enabled:true, environment_id, folder_path}`. The `environment_id` comes from Claude Desktop itself: `RemoteControlServing.requestAddFolder()` opens a folder picker, registers the folder (`POST /v1/environments/bridge` with device keys) and stores it in `remote-control-state.json` per `org:account`. **At most 6 folders per PC** (`remoteControlServeStatusStore.getState()` → `limit: 6`). `GET …/remote-control-preapproval` lists the PC's environments. |
+| Library limits | `GET /v1/code/channels/{chan}/files/usage` | `limit_bytes` 10 GB, `limit_files` 50,000, `limit_file_bytes` 500 MB per project. |
 | Seen, not yet used | `GET /v1/code/project-templates` (`{templates:[]}`), `/v1/code/project-conversions/{id}` (a convert-classic-project feature exists; create call not observed). |
 
 ## 4. How ClaudeLift can reach the signed-in claude.ai page
@@ -96,12 +100,20 @@ Headers for `/v1/code/*`: `content-type: application/json`, `anthropic-version: 
 - Only GET calls until the user approves a write run. Writes go only to the account the user picked; show its email before writing.
 - The new layout needs no Claude Desktop restart; nothing is written to the local Cowork folder.
 
+### 7.1 Limits and traps found in the real run (2026-10-03, 65 projects, ~33,000 files)
+
+- `POST /v1/code/channels` answers **429 "Too many projects created. Retry in Ns."** after about a dozen creates in a row; waiting the asked time works.
+- The chat upload `POST /api/{org}/upload` answers **413 "Uploaded file too large"** above about 30 MB. The Library's own upload (`files:beginUpload` + filestore `createFile`, recorded 2026-10-03) takes up to 480 MB; ClaudeLift now uses it.
+- The chat upload also answers **429 "Exceeded file limits"** (`file_limit_exceeded`) after about **20,000 uploads in one day** (still on 10 hours later). The Library upload kept working during that limit.
+- `files:write` answers **200 but drops** paths with control characters, garbled UTF-8 (`â\x80\x99`) or invisible characters (U+FE0F); the dropped path is missing from `results`. Clean names first; count a file only when `results` confirms its path.
+- `GET …/memories` returns 20 notes by default; ask `?limit=100`.
+
 ## 8. Open questions
 
 - Plugin and skill upload calls (record them with the recorder while the user uploads one zip in Customize → Plugins / Skills).
 - Whether `/v1/code/project-conversions` can convert a classic project server-side (would replace parts of step 2).
 - Account-level memory location in the new layout (the "Account memory (imported)" project is the fallback).
-- Rate limits for bulk uploads (the proven project: 160 uploads plus 160 re-uploads in one session, no rate-limit errors seen; not measured further).
+- 3 PNG files in one project were dropped by `files:write` with plain names; cause unknown.
 
 ## 9. Acceptance
 

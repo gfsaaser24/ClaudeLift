@@ -460,6 +460,7 @@ export class EngineService {
       if (!req.includeChats) args.push('--no-chats')
       if (req.includeUnfiledChats) args.push('--include-unfiled-chats')
       if (!req.includeAccountMemory) args.push('--no-account-memory')
+      if (req.includeLocalFolders) args.push('--local-folders')
       for (const org of req.orgs) args.push(`--org=${org}`)
       const result = await this.run(args)
       if (result.code !== 0) throw engineErrorFromExit(result.code, result.stderr)

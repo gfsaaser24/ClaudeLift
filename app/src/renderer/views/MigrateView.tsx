@@ -1833,6 +1833,9 @@ function RebuildProjectsCard(): JSX.Element {
   const [includeChats, setIncludeChats] = useState(true)
   const [includeUnfiled, setIncludeUnfiled] = useState(false)
   const [includeAccountMemory, setIncludeAccountMemory] = useState(true)
+  const [includeLocalFolders, setIncludeLocalFolders] = useState(true)
+  const [topUp, setTopUp] = useState(false)
+  const [mergeExisting, setMergeExisting] = useState(false)
   const [planning, setPlanning] = useState(false)
   const [plan, setPlan] = useState<PushPlanSummary | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -1896,6 +1899,7 @@ function RebuildProjectsCard(): JSX.Element {
           includeChats,
           includeUnfiledChats: includeUnfiled,
           includeAccountMemory,
+          includeLocalFolders,
           orgs: []
         })
       )
@@ -1928,7 +1932,9 @@ function RebuildProjectsCard(): JSX.Element {
       keys: plan.projects.filter((p) => selected.has(p.key)).map((p) => p.key),
       executor,
       dryRun,
-      expectEmail: account?.email ?? null
+      expectEmail: account?.email ?? null,
+      topUp,
+      mergeExisting
     })
   }
 
@@ -1948,7 +1954,7 @@ function RebuildProjectsCard(): JSX.Element {
   const chosen = plan?.projects.filter((p) => selected.has(p.key)) ?? []
   const totals = chosen.reduce(
     (acc, p) => ({
-      files: acc.files + p.counts.docs + p.counts.files + p.counts.chats + p.counts.cowork,
+      files: acc.files + p.counts.docs + p.counts.files + p.counts.chats + p.counts.cowork + Number(p.counts.folder ?? 0),
       memory: acc.memory + p.counts.memory,
       bytes: acc.bytes + p.counts.bytes
     }),
@@ -1998,6 +2004,10 @@ function RebuildProjectsCard(): JSX.Element {
             <CheckField checked={includeAccountMemory} disabled={busy} onChange={setIncludeAccountMemory}>
               Account memory (an &ldquo;Account memory (imported)&rdquo; project)
             </CheckField>
+            <CheckField checked={includeLocalFolders} disabled={busy} onChange={setIncludeLocalFolders}>
+              Linked PC folders: their files go into the Library under the folder&apos;s name, like the
+              Library&apos;s &ldquo;Add folder&rdquo;
+            </CheckField>
           </div>
           <button
             type="button"
@@ -2040,6 +2050,7 @@ function RebuildProjectsCard(): JSX.Element {
                       <th className="text-right">Files</th>
                       <th className="text-right">Chats</th>
                       <th className="text-right">Cowork</th>
+                      <th className="text-right">Folder</th>
                       <th className="text-right">Memory</th>
                       <th className="text-right">MB</th>
                       <th>Notes</th>
@@ -2078,6 +2089,7 @@ function RebuildProjectsCard(): JSX.Element {
                         <td className="text-right tabular-nums">{p.counts.files}</td>
                         <td className="text-right tabular-nums">{p.counts.chats}</td>
                         <td className="text-right tabular-nums">{p.counts.cowork}</td>
+                        <td className="text-right tabular-nums">{Number(p.counts.folder ?? 0)}</td>
                         <td className="text-right tabular-nums">{p.counts.memory}</td>
                         <td className="text-right tabular-nums">{mb(p.counts.bytes)}</td>
                         <td>
@@ -2199,6 +2211,12 @@ function RebuildProjectsCard(): JSX.Element {
             />
             <span className="text-base-content">Dry run (only check, write nothing)</span>
           </label>
+          <CheckField checked={topUp} disabled={busy} onChange={setTopUp}>
+            Also add new files to projects ClaudeLift already made (nothing is replaced)
+          </CheckField>
+          <CheckField checked={mergeExisting} disabled={busy} onChange={setMergeExisting}>
+            Add to projects that already exist with the same name, even if you made them (nothing is replaced)
+          </CheckField>
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
@@ -2266,6 +2284,7 @@ function RebuildProjectsCard(): JSX.Element {
                 <span className="font-semibold">
                   {result.dryRun ? 'Dry run — nothing written. ' : ''}
                   {result.cancelled ? 'Cancelled. ' : ''}
+                  {result.stopped !== null ? `Stopped: ${result.stopped} ` : ''}
                   {result.projects.filter((p) => p.action === 'create').length} to create ·{' '}
                   {result.projects.filter((p) => p.action === 'resume').length} to finish ·{' '}
                   {result.projects.filter((p) => p.action === 'skip').length} skipped (

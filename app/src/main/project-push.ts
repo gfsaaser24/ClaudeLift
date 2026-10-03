@@ -46,8 +46,12 @@ export const PUSH_PLANS_DIR = 'push-plans'
 export const WRITE_BATCH = 25
 /** files:list accepts limit 1–500 (501 → 400). */
 export const LIST_LIMIT = 500
-/** Larger files are not sent (claude.ai's upload limit); the user adds them by hand. */
-export const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+/**
+ * Larger files are not sent; the user adds them by hand. The Library upload
+ * (`files:beginUpload`) takes up to 480 MB, but each file goes through the
+ * page as one base64 string, so ClaudeLift stops at 150 MB.
+ */
+export const MAX_UPLOAD_BYTES = 150 * 1024 * 1024
 /** Uploads in flight at once. */
 const UPLOAD_CONCURRENCY = 3
 const MAX_LIST_PAGES = 100
@@ -151,17 +155,23 @@ export function decideAction(
   name: string,
   key: string,
   channels: readonly ChannelInfo[],
-  prior: ReadonlyMap<string, PriorRun>
+  prior: ReadonlyMap<string, PriorRun>,
+  topUp = false,
+  mergeExisting = false
 ): { action: PushAction; chan: string | null; reason: string | null } {
   const wanted = name.trim().toLowerCase()
   const live = channels.find((c) => !c.archived && c.name.trim().toLowerCase() === wanted)
   if (live === undefined) return { action: 'create', chan: null, reason: null }
   const before = prior.get(key)
   if (before !== undefined && before.chan === live.id) {
+    if (before.complete && topUp) {
+      return { action: 'resume', chan: live.id, reason: 'Made by ClaudeLift; adding what is new.' }
+    }
     return before.complete
       ? { action: 'skip', chan: live.id, reason: 'Already rebuilt by ClaudeLift.' }
       : { action: 'resume', chan: live.id, reason: 'Made by ClaudeLift earlier; adding what is missing.' }
   }
+  if (mergeExisting) return { action: 'resume', chan: live.id, reason: 'Adding to the existing project.' }
   return { action: 'skip', chan: live.id, reason: 'A project with this name exists.' }
 }
 
@@ -215,24 +225,46 @@ export function apiCallJs(org: string, method: string, url: string, body?: unkno
 })(${lit({ org, method, url, body: body === undefined ? null : body })})`
 }
 
-/** Upload one file (base64) to the org's file store. Resolves `{ok, status, file_uuid, j}`. */
-export function uploadJs(org: string, name: string, mime: string, b64: string): string {
+/**
+ * Upload one file (base64) to a project's Library store, the way the
+ * Library's own upload does it: `files:beginUpload` (a short-lived upload
+ * token and a staging path, up to 480 MB), then `POST /v1/filestore/fs/createFile`
+ * with that token. The caller then `files:write`s `{staged_upload_path, path}`.
+ * (The chat-attachment upload `/api/{org}/upload` is NOT used: it stops at
+ * 30 MB and counts against a daily account file limit.)
+ * Resolves `{ok, status, upload_path, j}`.
+ */
+export function uploadJs(org: string, chan: string, name: string, mime: string, b64: string): string {
   return `(async (a) => {
+  const fail = (status, message) => ({ ok: false, status, upload_path: null, j: { error: { message } } })
   const bin = atob(a.b64)
   const bytes = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  const h = { accept: 'application/json', 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-beta': 'ccr-byoc-2025-07-29', 'x-organization-uuid': a.org }
+  let begin
+  try {
+    begin = await fetch('/v1/code/channels/' + encodeURIComponent(a.chan) + '/files:beginUpload', { method: 'POST', credentials: 'include', headers: h, body: JSON.stringify({ size_bytes: bytes.length }) })
+  } catch (e) {
+    return fail(0, 'Network error: ' + String(e && e.message || e))
+  }
+  let b = null
+  try { b = await begin.json() } catch (_) {}
+  if (!begin.ok || !b || typeof b.upload_path !== 'string' || typeof b.filestore_jwt !== 'string') {
+    return { ok: false, status: begin.status, upload_path: null, j: b }
+  }
   const fd = new FormData()
+  fd.append('params', new Blob([JSON.stringify({ filesystem_id: b.filesystem_id, path: b.upload_path, media_type: a.mime })], { type: 'application/json' }))
   fd.append('file', new File([bytes], a.name, { type: a.mime }))
   let r
   try {
-    r = await fetch('/api/' + a.org + '/upload?store_as_is=true', { method: 'POST', credentials: 'include', body: fd })
+    r = await fetch('/v1/filestore/fs/createFile', { method: 'POST', credentials: 'include', headers: { 'x-organization-uuid': a.org, authorization: 'Bearer ' + b.filestore_jwt }, body: fd })
   } catch (e) {
-    return { ok: false, status: 0, file_uuid: null, j: { error: { message: 'Network error: ' + String(e && e.message || e) } } }
+    return fail(0, 'Network error: ' + String(e && e.message || e))
   }
   let j = null
   try { j = await r.json() } catch (_) {}
-  return { ok: r.ok, status: r.status, file_uuid: j && typeof j.file_uuid === 'string' ? j.file_uuid : null, j: r.ok ? null : j }
-})(${lit({ org, name, mime, b64 })})`
+  return { ok: r.ok, status: r.status, upload_path: r.ok ? b.upload_path : null, j: r.ok ? null : j }
+})(${lit({ org, chan, name, mime, b64 })})`
 }
 
 /** Who is signed in: org list and the account email (bootstrap, then account profile). */
@@ -261,7 +293,8 @@ export const WHOAMI_JS = `(async () => {
 // -- receipts ----------------------------------------------------------------
 
 export interface ReceiptProject extends PushProjectResult {
-  files: { path: string; source_file_id: string }[]
+  /** Library paths written in this run, with the staging path each was written from. */
+  files: { path: string; staged_upload_path: string }[]
   memory_ids: string[]
 }
 
@@ -274,6 +307,8 @@ export interface Receipt {
   plan_file: string
   account: PushAccount
   cancelled: boolean
+  /** Why the run stopped early (e.g. the upload limit), else absent. */
+  stopped?: string
   projects: ReceiptProject[]
 }
 
@@ -319,6 +354,43 @@ function stamp(d: Date = new Date()): string {
 // API over an executor
 // ---------------------------------------------------------------------------
 
+/** How often one call is retried after HTTP 429. */
+export const MAX_RATE_RETRIES = 40
+const DEFAULT_RETRY_MS = 15_000
+const MAX_RETRY_MS = 5 * 60_000
+
+/** Wait asked for by a 429 answer ("Retry in 12s" / retry_after), plus a second; 15 s when it says nothing. */
+export function retryDelayMs(body: unknown): number {
+  const b = body as { retry_after?: unknown; error?: { retry_after?: unknown } } | null
+  const field = b?.retry_after ?? b?.error?.retry_after
+  let sec: number | null = typeof field === 'number' && Number.isFinite(field) ? field : null
+  if (sec === null) {
+    const m = /retry in (\d+(?:\.\d+)?)\s*s/i.exec(apiErrorText(body) ?? '')
+    if (m !== null) sec = Number(m[1])
+  }
+  if (sec === null) return DEFAULT_RETRY_MS
+  return Math.min(MAX_RETRY_MS, Math.max(1000, Math.ceil(sec * 1000) + 1000))
+}
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** A 429 that is the account's file upload limit, not a short slow-down: waiting seconds does not help. */
+export function isFileLimit(body: unknown): boolean {
+  const e = (body as { error?: { details?: { error_code?: unknown }; message?: unknown } } | null)?.error
+  return e?.details?.error_code === 'file_limit_exceeded' || /exceeded file limits/i.test(String(e?.message ?? ''))
+}
+
+/** Stops the whole run: claude.ai refuses more uploads for now. What is done stays; run again later. */
+export class UploadLimitError extends PushError {
+  constructor() {
+    super(
+      'crash',
+      "claude.ai's file upload limit for this account is reached (\"Exceeded file limits\"). Everything sent so far is kept. Run the push again later; it adds only what is missing."
+    )
+    this.name = 'UploadLimitError'
+  }
+}
+
 interface ApiAnswer {
   ok: boolean
   status: number
@@ -336,25 +408,74 @@ function asAnswer(raw: unknown): ApiAnswer {
 class Api {
   constructor(
     private readonly exec: PageExecutor,
-    readonly org: string
+    readonly org: string,
+    private readonly signal: AbortSignal | null = null,
+    private readonly sleep: (ms: number) => Promise<void> = defaultSleep,
+    private readonly onWait: ((line: string) => void) | null = null
   ) {}
 
-  async call(method: string, url: string, body?: unknown): Promise<ApiAnswer> {
-    return asAnswer(await this.exec.runInPage(apiCallJs(this.org, method, url, body)))
+  /**
+   * Run one page call; on HTTP 429 wait as long as claude.ai asks ("Retry
+   * in 12s"), then try again (MAX_RATE_RETRIES times). Bulk project
+   * creation hits this limit after about a dozen projects.
+   */
+  private async withRetry<T extends { status: number; body: unknown }>(run: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const res = await run()
+      if (res.status === 429 && isFileLimit(res.body)) throw new UploadLimitError()
+      if (res.status !== 429 || attempt >= MAX_RATE_RETRIES) return res
+      const ms = retryDelayMs(res.body)
+      this.onWait?.(`claude.ai asks to slow down; waiting ${Math.round(ms / 1000)} s`)
+      await this.abortableSleep(ms)
+      if (this.signal?.aborted === true) throw new PushError('aborted', 'Push cancelled.')
+    }
   }
 
-  async upload(name: string, mime: string, data: Buffer): Promise<{ ok: boolean; status: number; fileUuid: string | null; error: string | null }> {
-    const raw = (await this.exec.runInPage(uploadJs(this.org, name, mime, data.toString('base64')))) as {
-      ok?: boolean
-      status?: number
-      file_uuid?: string | null
-      j?: unknown
-    } | null
-    if (raw === null || typeof raw !== 'object') throw new PushError('crash', 'The claude.ai page gave no answer.')
+  /** The back-off wait ends at once on cancel (it can be up to 5 minutes). */
+  private abortableSleep(ms: number): Promise<void> {
+    const signal = this.signal
+    if (signal === null) return this.sleep(ms)
+    if (signal.aborted) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        signal.removeEventListener('abort', done)
+        resolve()
+      }
+      signal.addEventListener('abort', done, { once: true })
+      void this.sleep(ms).then(done, done)
+    })
+  }
+
+  async call(method: string, url: string, body?: unknown): Promise<ApiAnswer> {
+    const res = await this.withRetry(async () => {
+      const a = asAnswer(await this.exec.runInPage(apiCallJs(this.org, method, url, body)))
+      return { ...a, body: a.j }
+    })
+    return { ok: res.ok, status: res.status, j: res.j }
+  }
+
+  async upload(
+    chan: string,
+    name: string,
+    mime: string,
+    data: Buffer
+  ): Promise<{ ok: boolean; status: number; uploadPath: string | null; error: string | null }> {
+    const b64 = data.toString('base64')
+    const res = await this.withRetry(async () => {
+      const raw = (await this.exec.runInPage(uploadJs(this.org, chan, name, mime, b64))) as {
+        ok?: boolean
+        status?: number
+        upload_path?: string | null
+        j?: unknown
+      } | null
+      if (raw === null || typeof raw !== 'object') throw new PushError('crash', 'The claude.ai page gave no answer.')
+      return { raw, status: typeof raw.status === 'number' ? raw.status : 0, body: raw.j }
+    })
+    const raw = res.raw
     return {
       ok: raw.ok === true,
       status: typeof raw.status === 'number' ? raw.status : 0,
-      fileUuid: typeof raw.file_uuid === 'string' ? raw.file_uuid : null,
+      uploadPath: typeof raw.upload_path === 'string' ? raw.upload_path : null,
       error: raw.ok === true ? null : apiErrorText(raw.j)
     }
   }
@@ -407,7 +528,8 @@ class Api {
   }
 
   async memoryCount(chan: string): Promise<number> {
-    const res = await this.call('GET', `/v1/code/memory/channel/${chan}/memories`)
+    // The default page is 20 notes; the app itself asks for 100.
+    const res = await this.call('GET', `/v1/code/memory/channel/${chan}/memories?limit=100`)
     if (!res.ok) throw new PushError('crash', `Could not read the memory notes back (HTTP ${res.status}).`)
     const data = (res.j as { data?: unknown } | null)?.data
     return Array.isArray(data) ? data.length : 0
@@ -415,7 +537,10 @@ class Api {
 }
 
 /** Which account the page is signed in to, plus its live project names. Read-only. */
-export async function readAccount(exec: PageExecutor): Promise<{ account: PushAccount; channels: ChannelInfo[]; api: Api }> {
+export async function readAccount(
+  exec: PageExecutor,
+  opts: { signal?: AbortSignal; sleep?: (ms: number) => Promise<void>; onWait?: (line: string) => void } = {}
+): Promise<{ account: PushAccount; channels: ChannelInfo[]; api: Api }> {
   const who = (await exec.runInPage(WHOAMI_JS)) as {
     orgs?: { uuid: string; name: string | null; capabilities: string[] }[] | null
     email?: string | null
@@ -425,7 +550,7 @@ export async function readAccount(exec: PageExecutor): Promise<{ account: PushAc
   }
   const org = pickOrg(who.orgs)
   if (org === null) throw new PushError('validation', 'The account has no organization.')
-  const api = new Api(exec, org.uuid)
+  const api = new Api(exec, org.uuid, opts.signal ?? null, opts.sleep, opts.onWait ?? null)
   const channels = await api.channels()
   const account: PushAccount = {
     email: typeof who.email === 'string' ? who.email : null,
@@ -451,6 +576,12 @@ export interface PushRunOptions {
   outputDir: string
   signal: AbortSignal
   onProgress: (event: PushProgress) => void
+  /** Test hook for the 429 back-off wait. */
+  sleep?: (ms: number) => Promise<void>
+  /** Resume finished ClaudeLift projects too (adds only what is missing). */
+  topUp?: boolean
+  /** Add to a project of the same name that ClaudeLift did not make (adds only what is missing). */
+  mergeExisting?: boolean
 }
 
 function emptyResult(p: PushPlanProject, action: PushAction, chan: string | null, reason: string | null): ReceiptProject {
@@ -511,8 +642,14 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
     if (opts.signal.aborted) throw new PushError('aborted', 'Push cancelled.')
   }
 
+  // The project being worked on, so a rate-limit wait shows where it is.
+  let current: { p: PushPlanProject; index: number } | null = null
   progress(null, 0, 'account', 0, 0, `Checking the account in ${exec.label}…`)
-  const { account, channels, api } = await readAccount(exec)
+  const { account, channels, api } = await readAccount(exec, {
+    signal: opts.signal,
+    sleep: opts.sleep,
+    onWait: (line) => progress(current?.p ?? null, current?.index ?? 0, 'checking', 0, 0, line)
+  })
   if (!opts.dryRun) {
     if (opts.expectEmail === null || opts.expectEmail === '') {
       throw new PushError('validation', 'Check the target account first, then run again.')
@@ -548,8 +685,9 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
     for (const [i, p] of chosen.entries()) {
       checkCancel()
       const index = i + 1
+      current = { p, index }
       progress(p, index, 'checking')
-      const decision = decideAction(p.name, p.key, live, prior)
+      const decision = decideAction(p.name, p.key, live, prior, opts.topUp === true, opts.mergeExisting === true)
       const res = emptyResult(p, decision.action, decision.chan, decision.reason)
       receipt.projects.push(res)
       if (opts.dryRun || decision.action === 'skip') {
@@ -563,6 +701,12 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
       } catch (err) {
         if (err instanceof PushError && err.kind === 'aborted') throw err
         res.error = err instanceof Error ? err.message : String(err)
+        if (err instanceof UploadLimitError) {
+          // Every later project would hit the same limit: stop here.
+          progress(p, index, 'done', 0, 0, `${p.name}: stopped — ${res.error}`)
+          receipt.stopped = res.error
+          break
+        }
         progress(p, index, 'done', 0, 0, `${p.name}: failed — ${res.error}`)
       }
       await save()
@@ -580,6 +724,7 @@ export async function pushPlan(exec: PageExecutor, opts: PushRunOptions): Promis
     account,
     receiptFile,
     cancelled: receipt.cancelled,
+    stopped: receipt.stopped ?? null,
     projects: receipt.projects.map(({ files: _files, memory_ids: _ids, ...rest }) => rest)
   }
 }
@@ -610,6 +755,32 @@ async function pushOne(
   }
   const chan = res.chan
   if (chan === null) throw new PushError('crash', 'No project id.')
+
+  // 1b. linked PC folders (as the Library's "Add folder" records them)
+  if (p.context_sources.length > 0) {
+    checkCancel()
+    const got = await api.call('GET', `/v1/code/channels/${chan}`)
+    const current = ((got.j as { channel?: { context_sources?: unknown } } | null)?.channel?.context_sources ?? []) as {
+      kind?: unknown
+      name?: unknown
+    }[]
+    const merged = current
+      .filter((c) => typeof c.kind === 'string' && typeof c.name === 'string')
+      .map((c) => ({ kind: c.kind as string, name: c.name as string }))
+    const have = new Set(merged.map((c) => `${c.kind}\u0000${c.name.toLowerCase()}`))
+    const add = p.context_sources.filter((c) => !have.has(`${c.kind}\u0000${c.name.toLowerCase()}`))
+    if (!got.ok) {
+      res.library.failed.push({ path: '(folders)', step: 'folders', status: got.status, error: apiErrorText(got.j) })
+    } else if (add.length > 0) {
+      progress(p, index, 'create', 0, 0, `${p.name}: linking folder(s) ${add.map((c) => c.name).join(', ')}`)
+      const patched = await api.call('PATCH', `/v1/code/channels/${chan}`, {
+        context_sources: [...merged, ...add.map((c) => ({ kind: c.kind, name: c.name }))]
+      })
+      if (!patched.ok) {
+        res.library.failed.push({ path: '(folders)', step: 'folders', status: patched.status, error: apiErrorText(patched.j) })
+      }
+    }
+  }
 
   // 2. instructions
   checkCancel()
@@ -646,7 +817,7 @@ async function pushOne(
     return true
   })
   let done = 0
-  const pending: { path: string; source_file_id: string }[] = []
+  const pending: { path: string; staged_upload_path: string }[] = []
   const fail = (f: PushFailure): void => {
     res.library.failed.push(f)
   }
@@ -676,12 +847,13 @@ async function pushOne(
       }
       for (const e of batch) {
         const r = byPath.get(libraryKey(e.path))
-        if (r === undefined || r.entry != null) {
-          // No per-file result on a 2xx answer counts as written (read-back verifies).
+        // With a results list, only a confirmed path counts: claude.ai answers
+        // 200 for paths it silently drops (e.g. control characters in a name).
+        if ((r === undefined && byPath.size === 0) || (r !== undefined && r.entry != null)) {
           res.library.written++
           res.files.push(e)
         } else {
-          fail({ path: e.path, step: 'write', status: w.status, error: apiErrorText(r.error) ?? 'not written' })
+          fail({ path: e.path, step: 'write', status: w.status, error: (r && apiErrorText(r.error)) ?? 'claude.ai did not confirm this path' })
         }
       }
     }
@@ -690,7 +862,7 @@ async function pushOne(
   const poolError: unknown = await pool(todo, UPLOAD_CONCURRENCY, async (f) => {
     checkCancel()
     if (f.size > MAX_UPLOAD_BYTES) {
-      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 30 MB. Add it to the project by hand.' })
+      fail({ path: f.path, step: 'upload', status: null, error: 'Larger than 150 MB. Add it to the project by hand (the Library takes up to 480 MB).' })
     } else {
       let data: Buffer | null = null
       try {
@@ -700,10 +872,11 @@ async function pushOne(
       }
       if (data !== null) {
         try {
-          const up = await api.upload(basename(f.path), f.mime, data)
-          if (up.ok && up.fileUuid !== null) pending.push({ path: f.path, source_file_id: taggedId('file', up.fileUuid) })
+          const up = await api.upload(chan, basename(f.path), f.mime, data)
+          if (up.ok && up.uploadPath !== null) pending.push({ path: f.path, staged_upload_path: up.uploadPath })
           else fail({ path: f.path, step: 'upload', status: up.status, error: up.error })
         } catch (err) {
+          if (err instanceof UploadLimitError) throw err
           // One failed call (e.g. a network drop) fails this file, not the project.
           fail({ path: f.path, step: 'upload', status: null, error: err instanceof Error ? err.message : String(err) })
         }
@@ -777,5 +950,6 @@ function writtenOk(body: unknown, path: string): boolean {
   const r = (results as { path?: unknown; entry?: unknown }[]).find(
     (x) => typeof x.path === 'string' && libraryKey(x.path) === libraryKey(path)
   )
-  return r === undefined || r.entry != null
+  if (r === undefined) return results.length === 0
+  return r.entry != null
 }

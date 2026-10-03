@@ -871,6 +871,10 @@ export const PushPlanProjectSchema = z.object({
       redacted: z.number().int().default(0)
     })
   ),
+  /** Linked PC folders, as the Library's "Add folder" records them (files are under `<name>/`). */
+  context_sources: z
+    .array(z.object({ kind: z.string().min(1), name: z.string().min(1), path: z.string().optional() }))
+    .default([]),
   counts: PushCountsSchema,
   warnings: z.array(z.string()).default([]),
   empty: z.boolean().default(false)
@@ -894,6 +898,8 @@ export const PushPlanRequestSchema = z.object({
   includeChats: z.boolean(),
   includeUnfiledChats: z.boolean(),
   includeAccountMemory: z.boolean(),
+  /** Also each project's linked PC folders: their files under `<folder name>/` in the Library. */
+  includeLocalFolders: z.boolean().default(false),
   /** Only projects of these organizations (names); empty = all. */
   orgs: z.array(z.string().min(1)).default([])
 })
@@ -951,7 +957,11 @@ export const PushRunRequestSchema = z.object({
   executor: PushExecutorSchema,
   dryRun: z.boolean(),
   /** The email the user saw and confirmed; the run stops when the page is signed in to another account. */
-  expectEmail: z.string().nullable().optional()
+  expectEmail: z.string().nullable().optional(),
+  /** Also add missing files and notes to projects ClaudeLift made and finished before. */
+  topUp: z.boolean().optional(),
+  /** Add to projects of the same name that already exist (made by hand); nothing is replaced. */
+  mergeExisting: z.boolean().optional()
 })
 export type PushRunRequest = z.infer<typeof PushRunRequestSchema>
 
@@ -998,7 +1008,9 @@ export const PushRunResultSchema = z.object({
   account: PushAccountSchema,
   receiptFile: z.string(),
   projects: z.array(PushProjectResultSchema),
-  cancelled: z.boolean()
+  cancelled: z.boolean(),
+  /** Why the run stopped early (e.g. claude.ai's upload limit), else null. */
+  stopped: z.string().nullable().default(null)
 })
 export type PushRunResult = z.infer<typeof PushRunResultSchema>
 

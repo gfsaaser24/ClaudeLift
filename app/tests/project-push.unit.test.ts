@@ -27,6 +27,8 @@ import {
   priorRuns,
   projectUrl,
   pushPlan,
+  retryDelayMs,
+  MAX_RATE_RETRIES,
   taggedId,
   uploadJs,
   type ChannelInfo,
@@ -128,6 +130,21 @@ describe('small helpers', () => {
     expect(pickOrg(orgs)).toEqual({ uuid: 'b', name: 'Chat' })
     expect(pickOrg([orgs[0]])).toEqual({ uuid: 'a', name: 'API' })
     expect(pickOrg([])).toBeNull()
+  })
+})
+
+describe('retryDelayMs', () => {
+  it('reads "Retry in Ns" from the error message and adds a second', () => {
+    expect(retryDelayMs({ error: { message: 'Too many projects created. Retry in 12s.' } })).toBe(13_000)
+  })
+  it('prefers a numeric retry_after field', () => {
+    expect(retryDelayMs({ retry_after: 3 })).toBe(4000)
+    expect(retryDelayMs({ error: { retry_after: 2.5, message: 'Retry in 99s' } })).toBe(3500)
+  })
+  it('waits 15 s when the answer says nothing and caps long waits at 5 minutes', () => {
+    expect(retryDelayMs(null)).toBe(15_000)
+    expect(retryDelayMs({ error: { message: 'slow down' } })).toBe(15_000)
+    expect(retryDelayMs({ retry_after: 3600 })).toBe(300_000)
   })
 })
 
@@ -279,6 +296,16 @@ class FakeFile {
   }
 }
 
+class FakeBlob {
+  constructor(
+    readonly parts: unknown[],
+    readonly opts: { type?: string } = {}
+  ) {}
+  text(): string {
+    return this.parts.map(String).join('')
+  }
+}
+
 class FakeFormData {
   readonly entries: [string, unknown][] = []
   append(k: string, v: unknown): void {
@@ -288,8 +315,8 @@ class FakeFormData {
 
 /** Evaluate a generated page script like the page would, with fakes for the web APIs. */
 function evalInPage(js: string, fetchImpl: (url: string, init?: FetchInit) => unknown, extra: { alert?: () => void } = {}): Promise<unknown> {
-  const fn = new Function('fetch', 'FormData', 'File', 'atob', 'alert', `return ${js}`)
-  return fn(fetchImpl, FakeFormData, FakeFile, atob, extra.alert ?? (() => {})) as Promise<unknown>
+  const fn = new Function('fetch', 'FormData', 'File', 'Blob', 'atob', 'alert', `return ${js}`)
+  return fn(fetchImpl, FakeFormData, FakeFile, FakeBlob, atob, extra.alert ?? (() => {})) as Promise<unknown>
 }
 
 const okJson = (body: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => body })
@@ -359,54 +386,74 @@ describe('page-side network errors', () => {
     expect(JSON.stringify(got.j)).toContain('Failed to fetch')
   })
 
-  it('uploadJs resolves ok:false, status 0, null file_uuid when fetch throws', async () => {
-    const got = (await evalInPage(uploadJs('o', 'a', 'text/plain', 'YQ=='), boom)) as { ok: boolean; status: number; file_uuid: unknown }
-    expect(got).toMatchObject({ ok: false, status: 0, file_uuid: null })
+  it('uploadJs resolves ok:false, status 0, null upload_path when fetch throws', async () => {
+    const got = (await evalInPage(uploadJs('o', 'chan_1', 'a', 'text/plain', 'YQ=='), boom)) as { ok: boolean; status: number; upload_path: unknown }
+    expect(got).toMatchObject({ ok: false, status: 0, upload_path: null })
   })
 })
 
 describe('uploadJs', () => {
-  it('uploads the decoded bytes as multipart form data to the org store', async () => {
-    const fetchSpy = vi.fn(async () => okJson({ file_uuid: '11111111-2222-4333-8444-555555555555' }))
+  const begun = { filestore_jwt: 'jwt-1', upload_path: '/uploads/.incoming/u1', filesystem_id: 'pjfs_1', max_bytes: '503316480' }
+
+  it('asks the project for an upload slot, then sends the bytes to the file store with its token', async () => {
+    const fetchSpy = vi.fn(async (url: string) => (url.endsWith('files:beginUpload') ? okJson(begun) : okJson({ file: {} })))
     const b64 = Buffer.from('hello').toString('base64')
-    const got = await evalInPage(uploadJs('org-1', 'a.md', 'text/markdown', b64), fetchSpy)
-    expect(got).toEqual({ ok: true, status: 200, file_uuid: '11111111-2222-4333-8444-555555555555', j: null })
-    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, FetchInit]
-    expect(url).toBe('/api/org-1/upload?store_as_is=true')
-    expect(init.method).toBe('POST')
-    expect(init.credentials).toBe('include')
-    expect(init.headers).toBeUndefined()
-    const fd = init.body as FakeFormData
-    expect(fd.entries).toHaveLength(1)
-    const [field, file] = fd.entries[0] as [string, FakeFile]
-    expect(field).toBe('file')
+    const got = await evalInPage(uploadJs('org-1', 'chan_1', 'a.md', 'text/markdown', b64), fetchSpy)
+    expect(got).toEqual({ ok: true, status: 200, upload_path: '/uploads/.incoming/u1', j: null })
+
+    const [url1, init1] = fetchSpy.mock.calls[0] as unknown as [string, FetchInit]
+    expect(url1).toBe('/v1/code/channels/chan_1/files:beginUpload')
+    expect(init1.method).toBe('POST')
+    expect(JSON.parse(init1.body as string)).toEqual({ size_bytes: 5 })
+    expect(init1.headers).toMatchObject({ 'x-organization-uuid': 'org-1', 'anthropic-beta': 'ccr-byoc-2025-07-29' })
+
+    const [url2, init2] = fetchSpy.mock.calls[1] as unknown as [string, FetchInit]
+    expect(url2).toBe('/v1/filestore/fs/createFile')
+    expect(init2.headers).toEqual({ 'x-organization-uuid': 'org-1', authorization: 'Bearer jwt-1' })
+    const fd = init2.body as FakeFormData
+    const [pField, params] = fd.entries[0] as [string, FakeBlob]
+    expect(pField).toBe('params')
+    expect(JSON.parse(params.text())).toEqual({ filesystem_id: 'pjfs_1', path: '/uploads/.incoming/u1', media_type: 'text/markdown' })
+    const [fField, file] = fd.entries[1] as [string, FakeFile]
+    expect(fField).toBe('file')
     expect(file.name).toBe('a.md')
-    expect(file.type).toBe('text/markdown')
     expect(file.size).toBe(5)
     expect(Array.from(file.parts[0] as Uint8Array)).toEqual(Array.from(Buffer.from('hello')))
   })
 
-  it('returns the error body of a failed upload and a null file_uuid', async () => {
-    const fetchSpy = async () => okJson({ error: { message: 'too big' } }, 413)
-    expect(await evalInPage(uploadJs('o', 'a', 'text/plain', ''), fetchSpy)).toEqual({
+  it('returns the error body when the upload slot is refused, without sending the file', async () => {
+    const fetchSpy = vi.fn(async () => okJson({ error: { message: 'too big' } }, 413))
+    expect(await evalInPage(uploadJs('o', 'c', 'a', 'text/plain', ''), fetchSpy)).toEqual({
       ok: false,
       status: 413,
-      file_uuid: null,
+      upload_path: null,
       j: { error: { message: 'too big' } }
+    })
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports a refused file-store write', async () => {
+    const fetchSpy = vi.fn(async (url: string) =>
+      url.endsWith('files:beginUpload') ? okJson(begun) : okJson({ error: { message: 'expired' } }, 401)
+    )
+    expect(await evalInPage(uploadJs('o', 'c', 'a', 'text/plain', 'YQ=='), fetchSpy)).toEqual({
+      ok: false,
+      status: 401,
+      upload_path: null,
+      j: { error: { message: 'expired' } }
     })
   })
 
-  it('passes a hostile file name and org as data', async () => {
+  it('passes a hostile file name, project and org as data', async () => {
     const alertSpy = vi.fn()
-    const hostile = "a'); alert(1); ('</script> "
-    const fetchSpy = vi.fn(async () => okJson({ file_uuid: 'u' }))
-    await evalInPage(uploadJs(hostile, hostile, "text/plain'); alert(2); ('", 'YQ=='), fetchSpy, { alert: alertSpy })
+    const hostile = "a'); alert(1); ('</script> "
+    const fetchSpy = vi.fn(async (url: string) => (url.endsWith('files:beginUpload') ? okJson(begun) : okJson({})))
+    await evalInPage(uploadJs(hostile, hostile, hostile, "text/plain'); alert(2); ('", 'YQ=='), fetchSpy, { alert: alertSpy })
     expect(alertSpy).not.toHaveBeenCalled()
-    const [url, init] = fetchSpy.mock.calls[0] as unknown as [string, FetchInit]
-    expect(url).toBe(`/api/${hostile}/upload?store_as_is=true`)
-    const file = (init.body as FakeFormData).entries[0][1] as FakeFile
+    const [url] = fetchSpy.mock.calls[0] as unknown as [string, FetchInit]
+    expect(url).toBe(`/v1/code/channels/${encodeURIComponent(hostile)}/files:beginUpload`)
+    const file = ((fetchSpy.mock.calls[1] as unknown as [string, FetchInit])[1].body as FakeFormData).entries[1][1] as FakeFile
     expect(file.name).toBe(hostile)
-    expect(file.type).toBe("text/plain'); alert(2); ('")
   })
 })
 
@@ -430,13 +477,25 @@ class FakeClaude {
   files = new Map<string, string[]>()
   memories = new Map<string, unknown[]>()
   config = new Map<string, unknown>()
+  contextSources = new Map<string, unknown[]>()
+  /** Uploaded files; `uuid` holds the staging path. */
   uploads: { name: string; uuid: string }[] = []
+  /** Upload slots handed out by files:beginUpload: staging path -> token. */
+  slots = new Map<string, string>()
   email = 'new@example.com'
   /** files:write with more than one file answers 400. */
   failBatches = false
   /** files:write containing one of these paths answers 400. */
   failPaths = new Set<string>()
+  /** files:write answers 200 but leaves these paths out of its results (and does not store them). */
+  dropPaths = new Set<string>()
   memoryStatus = 200
+  /** The next N project creates answer 429 "Too many projects created. Retry in 12s." */
+  rateLimitedCreates = 0
+  /** The next N uploads answer 429 with retry_after 2. */
+  rateLimitedUploads = 0
+  /** Every upload answers 429 "Exceeded file limits" (the account's upload limit). */
+  fileLimit = false
   private created = 0
 
   fetch = async (url: string, init: FetchInit = {}): Promise<unknown> => {
@@ -445,19 +504,28 @@ class FakeClaude {
     const isForm = init.body instanceof FakeFormData
     const body = isForm || init.body === undefined ? init.body : JSON.parse(init.body as string)
     this.calls.push({ method, path, url, body, headers: init.headers ?? {} })
-    return this.route(method, path, body)
+    return this.route(method, path, body, init.headers ?? {})
   }
 
-  private route(method: string, path: string, body: unknown): unknown {
+  private route(method: string, path: string, body: unknown, headers: Record<string, string>): unknown {
     if (method === 'GET' && path === '/api/organizations') return okJson([{ uuid: ORG, name: 'Org', capabilities: ['chat'] }])
     if (method === 'GET' && path === '/api/bootstrap') return okJson({ account: { email_address: this.email } })
     if (method === 'GET' && path === '/api/account_profile') return okJson({}, 404)
     if (method === 'GET' && path === '/v1/code/channels') return okJson({ data: this.channels })
     if (method === 'POST' && path === '/v1/code/channels') {
+      if (this.rateLimitedCreates > 0) {
+        this.rateLimitedCreates--
+        return okJson({ error: { type: 'rate_limit_error', message: 'Too many projects created. Retry in 12s.' } }, 429)
+      }
       const id = ++this.created === 1 ? 'chan_X' : `chan_X${this.created}`
       this.channels.push({ id, name: (body as { name: string }).name, archived_at: null })
       this.files.set(id, [])
       return okJson({ channel: { id } }, 201)
+    }
+    const one = /^\/v1\/code\/channels\/(chan_[^/]+)$/.exec(path)
+    if (one !== null) {
+      if (method === 'PATCH') this.contextSources.set(one[1], (body as { context_sources: unknown[] }).context_sources)
+      return okJson({ channel: { id: one[1], context_sources: this.contextSources.get(one[1]) ?? [] } })
     }
     let m = /^\/v1\/code\/channels\/([^/]+)\/config$/.exec(path)
     if (m !== null) {
@@ -467,20 +535,39 @@ class FakeClaude {
       }
       return okJson({ system_prompt_addendum: this.config.get(m[1]) ?? null })
     }
-    if (method === 'POST' && path === `/api/${ORG}/upload`) {
-      const file = (body as FakeFormData).entries[0][1] as FakeFile
+    m = /^\/v1\/code\/channels\/([^/]+)\/files:beginUpload$/.exec(path)
+    if (m !== null && method === 'POST') {
+      if (this.fileLimit) {
+        return okJson(
+          { type: 'error', error: { type: 'rate_limit_error', message: 'Exceeded file limits', details: { error_code: 'file_limit_exceeded' } } },
+          429
+        )
+      }
+      if (this.rateLimitedUploads > 0) {
+        this.rateLimitedUploads--
+        return okJson({ error: { type: 'rate_limit_error', message: 'Too many uploads.' }, retry_after: 2 }, 429)
+      }
       const uuid = randomUUID()
-      this.uploads.push({ name: file.name, uuid })
-      return okJson({ file_uuid: uuid })
+      this.slots.set(`/uploads/.incoming/${uuid}`, `jwt-${uuid}`)
+      return okJson({ filestore_jwt: `jwt-${uuid}`, upload_path: `/uploads/.incoming/${uuid}`, filesystem_id: 'pjfs_T', max_bytes: '503316480' })
+    }
+    if (method === 'POST' && path === '/v1/filestore/fs/createFile') {
+      const fd = body as FakeFormData
+      const params = JSON.parse((fd.entries[0][1] as FakeBlob).text()) as { path: string }
+      const file = fd.entries[1][1] as FakeFile
+      if (this.slots.get(params.path) !== headers.authorization?.replace(/^Bearer /, '')) return okJson({ error: { message: 'bad token' } }, 401)
+      this.uploads.push({ name: file.name, uuid: params.path })
+      return okJson({ file: { path: params.path } })
     }
     m = /^\/v1\/code\/channels\/([^/]+)\/files:write$/.exec(path)
     if (m !== null && method === 'POST') {
-      const files = (body as { files: { path: string; source_file_id: string }[] }).files
+      const files = (body as { files: { path: string; staged_upload_path: string }[] }).files
       if ((this.failBatches && files.length > 1) || files.some((f) => this.failPaths.has(f.path))) {
         return okJson({ error: { message: 'bad entry' } }, 400)
       }
-      this.files.get(m[1])!.push(...files.map((f) => f.path))
-      return okJson({ results: files.map((f) => ({ path: f.path, entry: {} })) })
+      const kept = files.filter((f) => !this.dropPaths.has(f.path))
+      this.files.get(m[1])!.push(...kept.map((f) => f.path))
+      return okJson({ results: kept.map((f) => ({ path: f.path, entry: {} })) })
     }
     m = /^\/v1\/code\/channels\/([^/]+)\/files:list$/.exec(path)
     if (m !== null && method === 'POST') {
@@ -670,9 +757,9 @@ describe('pushPlan', () => {
     const writes = fake.fileWrites()
     expect(WRITE_BATCH).toBe(25)
     expect(writes.map((w) => (w.body as { files: unknown[] }).files.length).sort((a, b) => a - b)).toEqual([5, 25])
-    const sent = writes.flatMap((w) => (w.body as { files: { path: string; source_file_id: string }[] }).files)
+    const sent = writes.flatMap((w) => (w.body as { files: { path: string; staged_upload_path: string }[] }).files)
     expect(new Set(sent.map((f) => f.path)).size).toBe(30)
-    expect(new Set(sent.map((f) => f.source_file_id))).toEqual(new Set(fake.uploads.map((u) => taggedId('file', u.uuid))))
+    expect(new Set(sent.map((f) => f.staged_upload_path))).toEqual(new Set(fake.uploads.map((u) => u.uuid)))
 
     // memory with the not_exists precondition
     const mem = fake.calls.find((c) => c.method === 'POST' && c.path === '/v1/code/memory/channel/chan_X/memories')!
@@ -704,8 +791,137 @@ describe('pushPlan', () => {
     const rp = receipt.projects[0]
     expect(rp.chan).toBe('chan_X')
     expect(rp.files).toHaveLength(30)
-    for (const f of rp.files) expect(f.source_file_id).toMatch(/^file_01[1-9A-HJ-NP-Za-km-z]{22}$/)
+    for (const f of rp.files) expect(f.staged_upload_path).toMatch(/^\/uploads\/\.incoming\//)
     expect(rp.memory_ids).toEqual(['mem_1'])
+  })
+
+  it('waits and retries when claude.ai rate-limits project creation (429)', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = 2
+    const waits: number[] = []
+    const plan = planOf(await project('p1', 'Limited', 2))
+    const res = await run(fake, plan, { sleep: async (ms) => void waits.push(ms) })
+    expect(waits).toEqual([13_000, 13_000])
+    expect(res.projects[0].error).toBeNull()
+    expect(res.projects[0].complete).toBe(true)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(3)
+  })
+
+  it('gives up after MAX_RATE_RETRIES and reports the 429', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = MAX_RATE_RETRIES + 5
+    const plan = planOf(await project('p1', 'Always limited', 1))
+    const res = await run(fake, plan, { sleep: async () => {} })
+    expect(res.projects[0].error).toMatch(/HTTP 429/)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(MAX_RATE_RETRIES + 1)
+  })
+
+  it('waits and retries a rate-limited upload, then writes the file', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedUploads = 2
+    const waits: number[] = []
+    const plan = planOf(await project('p1', 'Upload limited', 1))
+    const res = await run(fake, plan, { sleep: async (ms) => void waits.push(ms) })
+    expect(waits).toEqual([3000, 3000])
+    expect(fake.calls.filter((c) => c.path.endsWith('files:beginUpload'))).toHaveLength(3)
+    expect(res.projects[0].library).toMatchObject({ written: 1, failed: [] })
+    expect(res.projects[0].complete).toBe(true)
+  })
+
+  it('a cancel ends a long 429 wait at once', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = 1
+    const ctl = new AbortController()
+    const plan = planOf(await project('p1', 'Long wait', 1))
+    // A sleep that never ends by itself: only the cancel can end the wait.
+    const pending = run(fake, plan, { signal: ctl.signal, sleep: () => new Promise(() => {}) })
+    await new Promise((r) => setTimeout(r, 50))
+    ctl.abort()
+    const res = await pending
+    expect(res.cancelled).toBe(true)
+  })
+
+  it('a path claude.ai leaves out of the files:write results counts as failed, not written', async () => {
+    const fake = new FakeClaude()
+    fake.dropPaths.add('/docs/p1-1.md')
+    const plan = planOf(await project('p1', 'Dropped', 3))
+    const res = await run(fake, plan)
+    expect(res.projects[0].library.written).toBe(2)
+    expect(res.projects[0].library.failed).toEqual([
+      expect.objectContaining({ path: '/docs/p1-1.md', step: 'write', error: 'claude.ai did not confirm this path' })
+    ])
+    expect(res.projects[0].complete).toBe(false)
+  })
+
+  it('links PC folders as local_folder context sources, keeping existing ones', async () => {
+    const fake = new FakeClaude()
+    const plan = planOf(
+      await project('p1', 'Folders', 1, {
+        context_sources: [
+          { kind: 'local_folder', name: 'Brain', path: String.raw`C:\x\Brain` },
+          { kind: 'local_folder', name: 'Old' }
+        ]
+      })
+    )
+    fake.contextSources.set('chan_X', [{ kind: 'local_folder', name: 'old', path: '', url: '' }])
+    const res = await run(fake, plan)
+    expect(res.projects[0].complete).toBe(true)
+    const patch = fake.calls.find((c) => c.method === 'PATCH' && c.path === '/v1/code/channels/chan_X')
+    expect(patch?.body).toEqual({
+      context_sources: [
+        { kind: 'local_folder', name: 'old' },
+        { kind: 'local_folder', name: 'Brain' }
+      ]
+    })
+  })
+
+  it('mergeExisting adds to a project of the same name that ClaudeLift did not make', async () => {
+    const fake = new FakeClaude()
+    fake.files.set('chan_E', [])
+    const plan = planOf(await project('p1', 'Existing', 2))
+    const res = await run(fake, plan, { mergeExisting: true })
+    expect(res.projects[0]).toMatchObject({ action: 'resume', chan: 'chan_E', reason: 'Adding to the existing project.' })
+    expect(res.projects[0].library.written).toBe(2)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(0)
+  })
+
+  it('topUp resumes a finished ClaudeLift project and adds only new files', async () => {
+    const fake = new FakeClaude()
+    const first = planOf(await project('p1', 'Grows', 2))
+    await run(fake, first)
+    const grown = planOf(await project('p1', 'Grows', 4))
+    const skipped = await run(fake, grown)
+    expect(skipped.projects[0].action).toBe('skip')
+    const before = fake.uploads.length
+    const topped = await run(fake, grown, { topUp: true })
+    expect(topped.projects[0].action).toBe('resume')
+    expect(fake.uploads.length - before).toBe(2)
+    expect(topped.projects[0].library).toMatchObject({ written: 2, existing: 2 })
+  })
+
+  it('stops the whole run at the account upload limit, without waiting', async () => {
+    const fake = new FakeClaude()
+    fake.fileLimit = true
+    const waits: number[] = []
+    const plan = planOf(await project('p1', 'First', 3), await project('p2', 'Second', 1))
+    const res = await run(fake, plan, { sleep: async (ms) => void waits.push(ms) })
+    expect(waits).toEqual([])
+    expect(res.stopped).toMatch(/upload limit/)
+    expect(res.projects).toHaveLength(1)
+    expect(res.projects[0].error).toMatch(/upload limit/)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(1)
+    const receipt = await readReceipt(join(outputDir, PUSH_RECEIPTS_DIR, (await receiptFiles('push-'))[0]))
+    expect(receipt.stopped).toMatch(/upload limit/)
+  })
+
+  it('a cancel during the 429 wait stops the run', async () => {
+    const fake = new FakeClaude()
+    fake.rateLimitedCreates = 5
+    const ctl = new AbortController()
+    const plan = planOf(await project('p1', 'Cancelled', 1))
+    const res = await run(fake, plan, { signal: ctl.signal, sleep: async () => ctl.abort() })
+    expect(res.cancelled).toBe(true)
+    expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v1/code/channels')).toHaveLength(1)
   })
 
   it('a second real run skips the project it already rebuilt', async () => {
@@ -774,7 +990,7 @@ describe('pushPlan', () => {
     expect(p.library.written).toBe(1)
     expect(p.library.failed).toHaveLength(1)
     expect(p.library.failed[0]).toMatchObject({ path: '/docs/p1-1.md', step: 'upload', status: null })
-    expect(p.library.failed[0].error).toMatch(/30 MB/)
+    expect(p.library.failed[0].error).toMatch(/150 MB/)
     expect(p.complete).toBe(false)
   })
 
@@ -843,7 +1059,7 @@ describe('pushPlan', () => {
     const exec: PageExecutor = {
       ...base,
       runInPage: async (js) => {
-        if (js.includes('upload?store_as_is') && js.includes('p1-1.md')) throw new Error('page crashed')
+        if (js.includes('files:beginUpload') && js.includes('p1-1.md')) throw new Error('page crashed')
         return base.runInPage(js)
       }
     }
